@@ -1,0 +1,106 @@
+.select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: var(--control-height);
+  border: var(--border-width, 1px) solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 11px;
+  background: var(--surface);
+  text-align: left;
+  font-size: var(--font-body);
+}
+
+.select-trigger > span {
+  /* 使用字体自然行高，保留下伸字母的完整字形。 */
+  line-height: normal;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.select-trigger:hover {
+  border-color: var(--border-strong);
+}
+
+.select-trigger[aria-expanded="true"] {
+  border-color: var(--text);
+}
+
+.select-trigger[data-empty="true"] > span {
+  color: var(--muted);
+}
+
+.select-menu {
+  /* 位置由组件按触发器的视口坐标算出。 */
+  position: fixed;
+  z-index: 1000;
+  max-width: calc(100vw - 16px);
+  padding: 4px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: var(--border-width, 1px) solid var(--border);
+  border-radius: var(--layout-radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.select-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  min-height: var(--control-height);
+}
+
+.select-option.is-focused {
+  background: var(--hover);
+}
+
+.select-footer {
+  display: block;
+  width: 100%;
+  /* 弹层自身 overflow: auto 会按圆角裁掉子元素，这里不用再倒角。 */
+  margin-top: 4px;
+  padding: 8px 10px;
+  border: 0;
+  border-top: var(--border-width, 1px) solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--secondary);
+  text-align: left;
+  font-size: var(--font-body);
+  cursor: pointer;
+}
+
+.select-footer:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.select-option > span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.select-option strong {
+  font-size: var(--font-body);
+  font-weight: 500;
+}
+
+.select-option small {
+  font-size: var(--font-label);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.select-root {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}

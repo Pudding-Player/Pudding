@@ -1,0 +1,1199 @@
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use super::kernel::*;
+use crate::runtime::store::artifacts::ArtifactStore;
+use crate::{
+    error::{Error, Result},
+    extension::{RiskLevel, VerificationMode},
+};
+
+pub trait ResourceBroker: Send + Sync {
+    fn read(&self, resource: &ResourceDescriptor) -> Result<Vec<u8>>;
+    fn replace(
+        &self,
+        resource: &ResourceDescriptor,
+        expected_hash: &str,
+        content: &[u8],
+    ) -> Result<()>;
+}
+
+pub trait MutationVerifier: Send + Sync {
+    fn verify(&self, snapshots: &[(ResourceSnapshot, Vec<u8>)], request: Value) -> Result<Value>;
+}
+
+impl MutationVerifier for crate::runtime::host::adapter::AdapterClient {
+    fn verify(&self, snapshots: &[(ResourceSnapshot, Vec<u8>)], request: Value) -> Result<Value> {
+        crate::runtime::host::adapter::AdapterClient::verify(self, snapshots, request)
+    }
+}
+
+#[derive(Default)]
+pub struct BrokerRegistry {
+    brokers: HashMap<String, Arc<dyn ResourceBroker>>,
+}
+
+impl BrokerRegistry {
+    pub fn register(
+        &mut self,
+        provider_id: impl Into<String>,
+        broker: Arc<dyn ResourceBroker>,
+    ) -> Result<()> {
+        let provider_id = provider_id.into();
+        if provider_id.is_empty() || self.brokers.insert(provider_id.clone(), broker).is_some() {
+            return Err(Error::Config(format!(
+                "duplicate or empty broker: {provider_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn get(&self, provider_id: &str) -> Result<Arc<dyn ResourceBroker>> {
+        self.brokers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| Error::Tool("资源 Provider 未提供提交 Broker".into()))
+    }
+}
+
+pub struct FileResourceBroker {
+    roots: Vec<PathBuf>,
+    max_bytes: u64,
+}
+
+impl FileResourceBroker {
+    pub fn new(roots: &[PathBuf], max_bytes: u64) -> Result<Self> {
+        let roots = roots
+            .iter()
+            .map(|root| root.canonicalize())
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if roots.is_empty() || max_bytes == 0 {
+            return Err(Error::Config(
+                "file broker requires canonical roots and a size limit".into(),
+            ));
+        }
+        Ok(Self { roots, max_bytes })
+    }
+
+    fn resolve(&self, resource: &ResourceDescriptor) -> Result<PathBuf> {
+        let path = resource.location["path"]
+            .as_str()
+            .ok_or_else(|| Error::Tool("文件资源缺少不透明路径绑定".into()))?;
+        let path = Path::new(path).canonicalize()?;
+        let root = self
+            .roots
+            .iter()
+            .find(|root| path.starts_with(root))
+            .ok_or_else(|| Error::Tool("文件资源超出 Adapter 授权根目录".into()))?;
+        let mut current = path.as_path();
+        while current.starts_with(root) && current != root {
+            if fs::symlink_metadata(current)?.file_type().is_symlink() {
+                return Err(Error::Tool("文件资源路径包含符号链接".into()));
+            }
+            current = current
+                .parent()
+                .ok_or_else(|| Error::Tool("文件资源路径无效".into()))?;
+        }
+        if fs::metadata(&path)?.len() > self.max_bytes {
+            return Err(Error::Tool("文件资源超过 Broker 大小限制".into()));
+        }
+        Ok(path)
+    }
+}
+
+impl ResourceBroker for FileResourceBroker {
+    fn read(&self, resource: &ResourceDescriptor) -> Result<Vec<u8>> {
+        Ok(fs::read(self.resolve(resource)?)?)
+    }
+
+    fn replace(
+        &self,
+        resource: &ResourceDescriptor,
+        expected_hash: &str,
+        content: &[u8],
+    ) -> Result<()> {
+        if content.len() as u64 > self.max_bytes {
+            return Err(Error::Tool(
+                "staged resource exceeds Broker size limit".into(),
+            ));
+        }
+        let destination = self.resolve(resource)?;
+        let current = fs::read(&destination)?;
+        if format!("{:x}", Sha256::digest(&current)) != expected_hash {
+            return Err(Error::Conflict("resource changed before commit".into()));
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::Tool("resource has no parent directory".into()))?;
+        let temporary = parent.join(format!(
+            ".{}.{}.pudding-stage",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("resource"),
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        let result = replace_file(&destination, &temporary);
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file(destination: &Path, temporary: &Path) -> Result<()> {
+    fs::rename(temporary, destination)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(destination: &Path, temporary: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let temporary_wide = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let success = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+pub struct OperationStore {
+    connection: Mutex<Connection>,
+}
+
+impl OperationStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut connection = Connection::open(path)?;
+        crate::runtime::store::migrations::migrate(&mut connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
+    pub fn upsert_resource(&self, resource: &ResourceDescriptor) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO runtime_resources(id,provider_id,kind,version,payload,updated_at) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,kind=excluded.kind,version=excluded.version,payload=excluded.payload,updated_at=excluded.updated_at",
+            params![resource.id, resource.provider_id, resource.kind, resource.version, serde_json::to_string(resource)?, crate::runtime::types::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn resource(&self, id: &str) -> Result<ResourceDescriptor> {
+        let payload: String = self.connection.lock().unwrap().query_row(
+            "SELECT payload FROM runtime_resources WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn resources(&self) -> Result<Vec<ResourceDescriptor>> {
+        read_payloads(
+            &self.connection,
+            "SELECT payload FROM runtime_resources ORDER BY kind,id",
+        )
+    }
+
+    pub fn save_snapshot(&self, snapshot: &ResourceSnapshot) -> Result<()> {
+        let mut db = self.connection.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO runtime_snapshots(id,resource_id,content_hash,payload,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![snapshot.id, snapshot.resource_id, snapshot.content_hash, serde_json::to_string(snapshot)?, snapshot.created_at],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO runtime_artifact_refs(artifact_id,owner_kind,owner_id,purpose,created_at) VALUES(?1,'resourceSnapshot',?2,'content',?3)",
+            params![snapshot.content_artifact,snapshot.id,snapshot.created_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn link_artifact(
+        &self,
+        artifact_id: &str,
+        owner_kind: &str,
+        owner_id: &str,
+        purpose: &str,
+    ) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO runtime_artifact_refs(artifact_id,owner_kind,owner_id,purpose,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![artifact_id,owner_kind,owner_id,purpose,crate::runtime::types::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn can_read_artifact(
+        &self,
+        artifact_id: &str,
+        owner_kind: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_artifact_refs WHERE artifact_id=?1 AND owner_kind=?2 AND owner_id=?3)",
+            params![artifact_id,owner_kind,owner_id],
+            |row|row.get(0),
+        )?)
+    }
+
+    pub fn snapshot(&self, id: &str) -> Result<ResourceSnapshot> {
+        let payload: String = self.connection.lock().unwrap().query_row(
+            "SELECT payload FROM runtime_snapshots WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn create(
+        &self,
+        run_id: Option<&str>,
+        title: &str,
+        plan: MutationPlan,
+    ) -> Result<Operation> {
+        plan.execution.validate()?;
+        if title.trim().is_empty()
+            || plan.id.trim().is_empty()
+            || plan.provider_id.trim().is_empty()
+        {
+            return Err(Error::Config(
+                "operation title, plan id and provider are required".into(),
+            ));
+        }
+        let stamp = crate::runtime::types::now();
+        let id = uuid::Uuid::new_v4().to_string();
+        let checkpoint = OperationCheckpoint {
+            operation_id: id.clone(),
+            state: OperationState::Draft,
+            completed_steps: vec![],
+            pending_step: None,
+            held_leases: vec![],
+            unresolved_attempts: vec![],
+            pending_approval: None,
+            revision: 0,
+            updated_at: stamp.clone(),
+        };
+        let operation = Operation {
+            id: id.clone(),
+            run_id: run_id.map(str::to_owned),
+            provider_id: plan.provider_id.clone(),
+            title: title.trim().into(),
+            state: OperationState::Draft,
+            revision: 0,
+            risk: plan.execution.risk,
+            plan,
+            checkpoint,
+            created_at: stamp.clone(),
+            updated_at: stamp.clone(),
+            result: None,
+            error: None,
+        };
+        let mut db = self.connection.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO runtime_operations(id,run_id,provider_id,state,revision,payload,created_at,updated_at) VALUES(?1,?2,?3,?4,0,?5,?6,?6)",
+            params![operation.id, operation.run_id, operation.provider_id, serde_json::to_string(&operation.state)?, serde_json::to_string(&operation)?, stamp],
+        )?;
+        for output in &operation.plan.staged_outputs {
+            if let StagedOutput::ReplaceResource {
+                content_artifact, ..
+            } = output
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO runtime_artifact_refs(artifact_id,owner_kind,owner_id,purpose,created_at) VALUES(?1,'operation',?2,'stagedOutput',?3)",
+                    params![content_artifact,operation.id,stamp],
+                )?;
+            }
+        }
+        insert_event(&tx, &operation.id, "operation.created", &json!(operation))?;
+        tx.commit()?;
+        Ok(operation)
+    }
+
+    pub fn get(&self, id: &str) -> Result<Operation> {
+        let payload: String = self.connection.lock().unwrap().query_row(
+            "SELECT payload FROM runtime_operations WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn list(&self) -> Result<Vec<Operation>> {
+        read_payloads(
+            &self.connection,
+            "SELECT payload FROM runtime_operations ORDER BY updated_at DESC LIMIT 200",
+        )
+    }
+
+    pub fn transition(&self, operation: &mut Operation, next: OperationState) -> Result<()> {
+        if !operation.state.permits(next) {
+            return Err(Error::Conflict(format!(
+                "invalid operation transition {:?} -> {:?}",
+                operation.state, next
+            )));
+        }
+        let previous = operation.revision;
+        let mut candidate = operation.clone();
+        candidate.state = next;
+        candidate.revision += 1;
+        candidate.updated_at = crate::runtime::types::now();
+        candidate.checkpoint.state = next;
+        candidate.checkpoint.revision = candidate.revision;
+        candidate.checkpoint.updated_at = candidate.updated_at.clone();
+        let mut db = self.connection.lock().unwrap();
+        let tx = db.transaction()?;
+        if tx.execute(
+            "UPDATE runtime_operations SET state=?1,revision=?2,payload=?3,updated_at=?4 WHERE id=?5 AND revision=?6",
+            params![serde_json::to_string(&next)?, candidate.revision, serde_json::to_string(&candidate)?, candidate.updated_at, candidate.id, previous],
+        )? != 1 {
+            return Err(Error::Conflict("stale operation revision".into()));
+        }
+        insert_event(&tx, &candidate.id, "operation.changed", &json!(candidate))?;
+        tx.commit()?;
+        *operation = candidate;
+        Ok(())
+    }
+
+    pub fn acquire(&self, scope: &str, operation_id: &str) -> Result<bool> {
+        Ok(self.connection.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO runtime_resource_leases(scope,operation_id,acquired_at) VALUES(?1,?2,?3)",
+            params![scope, operation_id, crate::runtime::types::now()],
+        )? == 1)
+    }
+
+    pub fn release(&self, scope: &str, operation_id: &str) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM runtime_resource_leases WHERE scope=?1 AND operation_id=?2",
+            params![scope, operation_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn release_operation(&self, operation_id: &str) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM runtime_resource_leases WHERE operation_id=?1",
+            [operation_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_evidence(
+        &self,
+        operation_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO runtime_evidence(id,operation_id,kind,payload,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![id, operation_id, kind, payload.to_string(), crate::runtime::types::now()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn recoverable(&self) -> Result<Vec<Operation>> {
+        let all = self.list()?;
+        Ok(all
+            .into_iter()
+            .filter(|operation| !operation.state.terminal())
+            .collect())
+    }
+
+    pub fn save_preference(&self, preference: &PreferenceRecord) -> Result<()> {
+        if !preference.explicitly_provided
+            || preference.key.trim().is_empty()
+            || preference.scope.trim().is_empty()
+        {
+            return Err(Error::Config("只保存用户明确提供且带作用域的偏好".into()));
+        }
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO runtime_preferences(key,scope,payload) VALUES(?1,?2,?3) ON CONFLICT(key,scope) DO UPDATE SET payload=excluded.payload",
+            params![preference.key, preference.scope, serde_json::to_string(preference)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn preferences(&self, scope: &str) -> Result<Vec<PreferenceRecord>> {
+        let db = self.connection.lock().unwrap();
+        let mut statement =
+            db.prepare("SELECT payload FROM runtime_preferences WHERE scope=?1 ORDER BY key")?;
+        let rows = statement
+            .query_map([scope], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Error::from))
+            .collect()
+    }
+
+    pub fn delete_preference(&self, key: &str, scope: &str) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "DELETE FROM runtime_preferences WHERE key=?1 AND scope=?2",
+            params![key, scope],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_metric(&self, metric: &MetricEvent) -> Result<()> {
+        if metric.name.trim().is_empty() || !metric.value.is_finite() {
+            return Err(Error::Config("metric name or value is invalid".into()));
+        }
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO runtime_metrics(name,recorded_at,payload) VALUES(?1,?2,?3)",
+            params![
+                metric.name,
+                metric.recorded_at,
+                serde_json::to_string(metric)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn metrics(&self, limit: usize) -> Result<Vec<MetricEvent>> {
+        let db = self.connection.lock().unwrap();
+        let mut statement =
+            db.prepare("SELECT payload FROM runtime_metrics ORDER BY id DESC LIMIT ?1")?;
+        let rows = statement
+            .query_map([limit.clamp(1, 1000)], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Error::from))
+            .collect()
+    }
+
+    pub fn save_diagnostic(&self, finding: &DiagnosticFinding) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO runtime_diagnostics(id,provider_id,kind,payload,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![finding.id, finding.provider_id, serde_json::to_string(&finding.kind)?, serde_json::to_string(finding)?, finding.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn diagnostics(&self) -> Result<Vec<DiagnosticFinding>> {
+        read_payloads(
+            &self.connection,
+            "SELECT payload FROM runtime_diagnostics ORDER BY created_at DESC LIMIT 200",
+        )
+    }
+
+    pub fn save_grant(
+        &self,
+        grant: &crate::runtime::operation::permissions::TrustGrant,
+    ) -> Result<()> {
+        crate::runtime::operation::permissions::PermissionEngine::validate_grant(grant)?;
+        self.connection.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO runtime_trust_grants(id,payload,expires_at,revoked_at) VALUES(?1,?2,?3,NULL)",
+            params![grant.id, serde_json::to_string(grant)?, grant.expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn grants(&self) -> Result<Vec<crate::runtime::operation::permissions::TrustGrant>> {
+        read_payloads(
+            &self.connection,
+            "SELECT payload FROM runtime_trust_grants WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at>unixepoch()) ORDER BY rowid DESC",
+        )
+    }
+
+    pub fn revoke_grant(&self, id: &str) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE runtime_trust_grants SET revoked_at=?1 WHERE id=?2",
+            params![crate::runtime::types::now(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn notify(
+        &self,
+        kind: &str,
+        title: &str,
+        message: &str,
+        target: Option<Value>,
+    ) -> Result<NotificationRecord> {
+        if kind.trim().is_empty() || title.trim().is_empty() || message.trim().is_empty() {
+            return Err(Error::Config(
+                "notification kind, title and message are required".into(),
+            ));
+        }
+        let notification = NotificationRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: kind.into(),
+            title: title.into(),
+            message: message.into(),
+            target,
+            created_at: crate::runtime::types::now(),
+            read_at: None,
+        };
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO runtime_notifications(id,kind,payload,created_at) VALUES(?1,?2,?3,?4)",
+            params![
+                notification.id,
+                notification.kind,
+                serde_json::to_string(&notification)?,
+                notification.created_at
+            ],
+        )?;
+        Ok(notification)
+    }
+
+    pub fn notifications(&self, unread_only: bool) -> Result<Vec<NotificationRecord>> {
+        let sql = if unread_only {
+            "SELECT payload FROM runtime_notifications WHERE read_at IS NULL ORDER BY created_at DESC LIMIT 100"
+        } else {
+            "SELECT payload FROM runtime_notifications ORDER BY created_at DESC LIMIT 100"
+        };
+        read_payloads(&self.connection, sql)
+    }
+
+    pub fn mark_notification_read(&self, id: &str) -> Result<()> {
+        let stamp = crate::runtime::types::now();
+        let mut db = self.connection.lock().unwrap();
+        let tx = db.transaction()?;
+        let payload: String = tx.query_row(
+            "SELECT payload FROM runtime_notifications WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let mut notification: NotificationRecord = serde_json::from_str(&payload)?;
+        notification.read_at = Some(stamp.clone());
+        tx.execute(
+            "UPDATE runtime_notifications SET payload=?1,read_at=?2 WHERE id=?3",
+            params![serde_json::to_string(&notification)?, stamp, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+pub struct OperationEngine {
+    pub store: Arc<OperationStore>,
+    pub artifacts: Arc<ArtifactStore>,
+    brokers: Arc<Mutex<BrokerRegistry>>,
+    verifiers: Arc<Mutex<HashMap<String, Arc<dyn MutationVerifier>>>>,
+}
+
+impl OperationEngine {
+    pub fn new(store: Arc<OperationStore>, artifacts: Arc<ArtifactStore>) -> Self {
+        Self {
+            store,
+            artifacts,
+            brokers: Arc::new(Mutex::new(BrokerRegistry::default())),
+            verifiers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn register_broker(
+        &self,
+        provider_id: impl Into<String>,
+        broker: Arc<dyn ResourceBroker>,
+    ) -> Result<()> {
+        self.brokers.lock().unwrap().register(provider_id, broker)
+    }
+
+    pub fn configure_file_brokers(&self, specs: &[(String, Vec<PathBuf>)]) -> Result<()> {
+        let mut registry = BrokerRegistry::default();
+        for (provider, roots) in specs {
+            registry.register(
+                provider.clone(),
+                Arc::new(FileResourceBroker::new(roots, 64 * 1024 * 1024)?),
+            )?;
+        }
+        *self.brokers.lock().unwrap() = registry;
+        Ok(())
+    }
+
+    pub fn configure_verifiers(
+        &self,
+        adapters: &[Arc<crate::runtime::host::adapter::AdapterClient>],
+    ) {
+        *self.verifiers.lock().unwrap() = adapters
+            .iter()
+            .map(|adapter| {
+                (
+                    adapter.provider_id(),
+                    adapter.clone() as Arc<dyn MutationVerifier>,
+                )
+            })
+            .collect();
+    }
+
+    pub fn snapshot(&self, resource: &ResourceDescriptor) -> Result<ResourceSnapshot> {
+        let broker = self.brokers.lock().unwrap().get(&resource.provider_id)?;
+        let content = broker.read(resource)?;
+        let content_hash = format!("{:x}", Sha256::digest(&content));
+        let artifact = self.artifacts.put(&content)?;
+        let snapshot = ResourceSnapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            resource_id: resource.id.clone(),
+            resource_version: resource.version.clone(),
+            content_artifact: artifact,
+            content_hash,
+            metadata: Value::Null,
+            created_at: crate::runtime::types::now(),
+        };
+        self.store.save_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub fn recover(&self) -> Result<()> {
+        for mut operation in self.store.recoverable()? {
+            operation.error = Some("应用中断后已根据最后一个持久检查点恢复".into());
+            match operation.state {
+                OperationState::Draft | OperationState::Prepared => {
+                    self.store.release_operation(&operation.id)?;
+                    self.store
+                        .transition(&mut operation, OperationState::Cancelled)?;
+                }
+                OperationState::AwaitingAuthorization => {}
+                OperationState::Validating | OperationState::Preparing => {
+                    self.store.release_operation(&operation.id)?;
+                    self.store
+                        .transition(&mut operation, OperationState::Failed)?;
+                }
+                OperationState::Committing
+                | OperationState::Verifying
+                | OperationState::RollingBack
+                | OperationState::Cancelling
+                | OperationState::Recovering => {
+                    if operation.state != OperationState::Recovering {
+                        self.store
+                            .transition(&mut operation, OperationState::Recovering)?;
+                    }
+                    self.store
+                        .transition(&mut operation, OperationState::NeedsReview)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn execute_pre_authorized(&self, operation_id: &str) -> Result<Operation> {
+        let mut operation = self.store.get(operation_id)?;
+        if operation.state != OperationState::AwaitingAuthorization {
+            return Err(Error::Conflict("操作尚未进入等待授权状态".into()));
+        }
+        let broker = match self.brokers.lock().unwrap().get(&operation.provider_id) {
+            Ok(broker) => broker,
+            Err(error) => {
+                operation.error = Some(error.user_message());
+                self.store
+                    .transition(&mut operation, OperationState::Failed)?;
+                return Ok(operation);
+            }
+        };
+        self.store
+            .transition(&mut operation, OperationState::Preparing)?;
+        let preparation = (|| {
+            let mut snapshots = HashMap::new();
+            for precondition in &operation.plan.resources {
+                let resource = self.store.resource(&precondition.resource_id)?;
+                if resource.provider_id != operation.provider_id
+                    || resource.version != precondition.expected_version
+                {
+                    return Err(Error::Conflict("资源 Provider 或版本已经变化".into()));
+                }
+                let snapshot = self.snapshot(&resource)?;
+                if snapshot.content_hash != precondition.expected_hash {
+                    return Err(Error::Conflict("资源内容已经变化，未执行修改".into()));
+                }
+                snapshots.insert(resource.id.clone(), snapshot);
+            }
+            Ok(snapshots)
+        })();
+        let snapshots = match preparation {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                operation.error = Some(error.user_message());
+                self.store.release_operation(&operation.id)?;
+                self.store
+                    .transition(&mut operation, OperationState::Failed)?;
+                return Ok(operation);
+            }
+        };
+        operation.plan.compensation.restore_snapshots = snapshots
+            .values()
+            .map(|snapshot| snapshot.id.clone())
+            .collect();
+        let scope = operation
+            .plan
+            .execution
+            .lease_scope
+            .clone()
+            .unwrap_or_else(|| format!("provider:{}", operation.provider_id));
+        if !self.store.acquire(&scope, &operation.id)? {
+            operation.error = Some("资源正在被另一项操作使用".into());
+            self.store
+                .transition(&mut operation, OperationState::Failed)?;
+            return Ok(operation);
+        }
+        operation.checkpoint.held_leases.push(scope.clone());
+        self.store
+            .transition(&mut operation, OperationState::Prepared)?;
+        self.store
+            .transition(&mut operation, OperationState::Committing)?;
+        let mut committed_resources = Vec::new();
+        let result = (|| {
+            for output in &operation.plan.staged_outputs {
+                match output {
+                    StagedOutput::ReplaceResource {
+                        resource_id,
+                        content_artifact,
+                        expected_hash,
+                    } => {
+                        let resource = self.store.resource(resource_id)?;
+                        let content = self.artifacts.get(content_artifact)?;
+                        broker.replace(&resource, expected_hash, &content)?;
+                        committed_resources.push(resource_id.clone());
+                    }
+                    StagedOutput::BrokeredAction { .. } => {
+                        return Err(Error::Tool("该系统操作尚未注册受信执行器".into()));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            operation.error = Some(error.user_message());
+            self.store
+                .transition(&mut operation, OperationState::RollingBack)?;
+            let restored = self.restore_snapshots(&operation, &broker, &committed_resources);
+            self.store.transition(
+                &mut operation,
+                if restored.is_ok() {
+                    OperationState::RolledBack
+                } else {
+                    OperationState::NeedsReview
+                },
+            )?;
+            self.store.release(&scope, &operation.id)?;
+            return Ok(operation);
+        }
+        self.store
+            .transition(&mut operation, OperationState::Verifying)?;
+        let mut evidence = Vec::new();
+        let mut verified_snapshots = Vec::new();
+        for output in &operation.plan.staged_outputs {
+            if let StagedOutput::ReplaceResource {
+                resource_id,
+                content_artifact,
+                ..
+            } = output
+            {
+                let resource = self.store.resource(resource_id)?;
+                let actual = broker.read(&resource)?;
+                let expected = self.artifacts.get(content_artifact)?;
+                if actual != expected {
+                    operation.error = Some("提交后的资源与计划结果不一致".into());
+                    self.store
+                        .transition(&mut operation, OperationState::NeedsReview)?;
+                    return Ok(operation);
+                }
+                evidence.push(self.store.record_evidence(&operation.id, "contentHash", json!({"resourceId":resource_id,"hash":format!("{:x}",Sha256::digest(&actual))}))?);
+                verified_snapshots.push((self.snapshot(&resource)?, actual));
+            }
+        }
+        if operation.plan.verification.provider_id != operation.provider_id {
+            operation.error = Some("验证请求使用了错误的 Provider".into());
+            self.store
+                .transition(&mut operation, OperationState::NeedsReview)?;
+            return Ok(operation);
+        }
+        let verifier = self
+            .verifiers
+            .lock()
+            .unwrap()
+            .get(&operation.provider_id)
+            .cloned();
+        if operation.plan.execution.verification == VerificationMode::Plugin {
+            let Some(verifier) = verifier else {
+                operation.error = Some("领域验证 Adapter 当前不可用".into());
+                self.store
+                    .transition(&mut operation, OperationState::NeedsReview)?;
+                return Ok(operation);
+            };
+            let verification = match verifier.verify(
+                &verified_snapshots,
+                json!({"method":operation.plan.verification.method,"input":operation.plan.verification.input}),
+            ) {
+                Ok(verification) => verification,
+                Err(error) => {
+                    operation.error = Some(format!(
+                        "领域验证未完成：{}",
+                        error.user_message()
+                    ));
+                    self.store
+                        .transition(&mut operation, OperationState::NeedsReview)?;
+                    return Ok(operation);
+                }
+            };
+            match verification["status"].as_str() {
+                Some("succeeded") => {
+                    evidence.push(self.store.record_evidence(
+                        &operation.id,
+                        "pluginVerification",
+                        verification,
+                    )?);
+                }
+                Some("failed") => {
+                    operation.error = Some("领域验证未通过，正在恢复原资源".into());
+                    self.store
+                        .transition(&mut operation, OperationState::RollingBack)?;
+                    let restored =
+                        self.restore_snapshots(&operation, &broker, &committed_resources);
+                    self.store.transition(
+                        &mut operation,
+                        if restored.is_ok() {
+                            OperationState::RolledBack
+                        } else {
+                            OperationState::NeedsReview
+                        },
+                    )?;
+                    self.store.release(&scope, &operation.id)?;
+                    return Ok(operation);
+                }
+                _ => {
+                    operation.error = Some("领域验证结果未知，需要核对".into());
+                    self.store
+                        .transition(&mut operation, OperationState::NeedsReview)?;
+                    return Ok(operation);
+                }
+            }
+        }
+        operation.result = Some(json!({"verified":true,"evidenceIds":evidence}));
+        self.store
+            .transition(&mut operation, OperationState::Succeeded)?;
+        self.store.release(&scope, &operation.id)?;
+        Ok(operation)
+    }
+
+    pub fn request_authorization(&self, operation_id: &str) -> Result<Operation> {
+        let mut operation = self.store.get(operation_id)?;
+        self.store
+            .transition(&mut operation, OperationState::Validating)?;
+        if let Err(error) = validate_plan(&operation.plan) {
+            operation.error = Some(error.user_message());
+            self.store
+                .transition(&mut operation, OperationState::Failed)?;
+            return Ok(operation);
+        }
+        self.store
+            .transition(&mut operation, OperationState::AwaitingAuthorization)?;
+        Ok(operation)
+    }
+
+    pub fn rollback(&self, operation_id: &str) -> Result<Operation> {
+        let mut operation = self.store.get(operation_id)?;
+        if operation.state != OperationState::NeedsReview {
+            return Err(Error::Conflict("只有待核对操作可以请求安全回退".into()));
+        }
+        self.store
+            .transition(&mut operation, OperationState::RollingBack)?;
+        let broker = self.brokers.lock().unwrap().get(&operation.provider_id)?;
+        let committed = operation
+            .plan
+            .staged_outputs
+            .iter()
+            .filter_map(|output| match output {
+                StagedOutput::ReplaceResource { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let restored = self.restore_snapshots(&operation, &broker, &committed);
+        let next = match restored {
+            Ok(()) => OperationState::RolledBack,
+            Err(error) => {
+                operation.error = Some(error.user_message());
+                OperationState::NeedsReview
+            }
+        };
+        self.store.transition(&mut operation, next)?;
+        if operation.state == OperationState::RolledBack {
+            self.store.release_operation(&operation.id)?;
+        }
+        Ok(operation)
+    }
+
+    pub fn cancel(&self, operation_id: &str) -> Result<Operation> {
+        let mut operation = self.store.get(operation_id)?;
+        if operation.state.terminal() {
+            return Ok(operation);
+        }
+        if operation.state == OperationState::NeedsReview {
+            return Err(Error::Conflict(
+                "效果尚未确认，不能用取消代替核对或回退".into(),
+            ));
+        }
+        let effects_may_exist = matches!(
+            operation.state,
+            OperationState::Committing
+                | OperationState::Verifying
+                | OperationState::RollingBack
+                | OperationState::Recovering
+        );
+        self.store
+            .transition(&mut operation, OperationState::Cancelling)?;
+        self.store.transition(
+            &mut operation,
+            if effects_may_exist {
+                OperationState::NeedsReview
+            } else {
+                OperationState::Cancelled
+            },
+        )?;
+        if operation.state == OperationState::Cancelled {
+            self.store.release_operation(&operation.id)?;
+        }
+        Ok(operation)
+    }
+
+    pub fn permission_decision(
+        &self,
+        operation: &Operation,
+        mode: crate::runtime::operation::permissions::PermissionMode,
+        grants: &[crate::runtime::operation::permissions::TrustGrant],
+    ) -> Result<crate::runtime::operation::permissions::PermissionDecision> {
+        let resource_ids = operation
+            .plan
+            .resources
+            .iter()
+            .map(|resource| resource.resource_id.clone())
+            .collect::<Vec<_>>();
+        let resource_kinds = resource_ids
+            .iter()
+            .map(|id| self.store.resource(id).map(|resource| resource.kind))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(
+            crate::runtime::operation::permissions::PermissionEngine::decide(
+                mode,
+                &crate::runtime::operation::permissions::PermissionRequest {
+                    provider_id: &operation.provider_id,
+                    resource_ids: &resource_ids,
+                    resource_kinds: &resource_kinds,
+                    effect: operation.plan.execution.effect,
+                    risk: operation.plan.execution.risk,
+                    unattended: operation.plan.execution.unattended,
+                    // 除删除外，规模由计划的执行契约给出。
+                    scope: Some(
+                        if operation.plan.execution.scope == crate::extension::ScopeKind::Delete {
+                            crate::runtime::operation::permissions::ChangeScope::delete()
+                        } else {
+                            crate::runtime::operation::permissions::ChangeScope {
+                                objects: operation.plan.staged_outputs.len(),
+                                ..crate::runtime::operation::permissions::ChangeScope::default()
+                            }
+                        },
+                    ),
+                },
+                grants,
+            ),
+        )
+    }
+
+    fn restore_snapshots(
+        &self,
+        operation: &Operation,
+        broker: &Arc<dyn ResourceBroker>,
+        committed_resources: &[String],
+    ) -> Result<()> {
+        for id in operation.plan.compensation.restore_snapshots.iter().rev() {
+            let snapshot = self.store.snapshot(id)?;
+            if !committed_resources.contains(&snapshot.resource_id) {
+                continue;
+            }
+            let resource = self.store.resource(&snapshot.resource_id)?;
+            let current = broker.read(&resource)?;
+            let current_hash = format!("{:x}", Sha256::digest(&current));
+            let staged_artifact = operation
+                .plan
+                .staged_outputs
+                .iter()
+                .find_map(|output| match output {
+                    StagedOutput::ReplaceResource {
+                        resource_id,
+                        content_artifact,
+                        ..
+                    } if resource_id == &snapshot.resource_id => Some(content_artifact),
+                    _ => None,
+                })
+                .ok_or_else(|| Error::Conflict("缺少已提交资源的 staged artifact".into()))?;
+            let staged = self.artifacts.get(staged_artifact)?;
+            let staged_hash = format!("{:x}", Sha256::digest(&staged));
+            let original = self.artifacts.get(&snapshot.content_artifact)?;
+            let content = if current_hash == staged_hash {
+                original
+            } else {
+                restore_json_changes(&original, &staged, &current)?
+            };
+            broker.replace(&resource, &current_hash, &content)?;
+        }
+        Ok(())
+    }
+}
+
+/// Undo our JSON changes only; preserve independent edits made afterwards.
+fn restore_json_changes(original: &[u8], applied: &[u8], current: &[u8]) -> Result<Vec<u8>> {
+    fn merge(
+        base: Option<&Value>,
+        applied: Option<&Value>,
+        current: Option<&Value>,
+        path: &str,
+    ) -> Result<Option<Value>> {
+        if base == applied {
+            return Ok(current.cloned());
+        }
+        if current == base {
+            return Ok(current.cloned());
+        }
+        if current == applied {
+            return Ok(base.cloned());
+        }
+        if let (Some(Value::Object(after)), Some(Value::Object(now))) = (applied, current)
+            && (base.is_none() || base.is_some_and(Value::is_object))
+        {
+            let before = base.and_then(Value::as_object);
+            let mut output = now.clone();
+            let keys = after
+                .keys()
+                .chain(before.into_iter().flat_map(|o| o.keys()))
+                .collect::<std::collections::BTreeSet<_>>();
+            for key in keys {
+                let child = format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"));
+                match merge(
+                    before.and_then(|o| o.get(key)),
+                    after.get(key),
+                    now.get(key),
+                    &child,
+                )? {
+                    Some(value) => {
+                        output.insert(key.clone(), value);
+                    }
+                    None => {
+                        output.remove(key);
+                    }
+                }
+            }
+            return Ok(Some(Value::Object(output)));
+        }
+        Err(Error::Conflict(format!(
+            "回退目标 {path} 在提交后又被修改，已保留较新内容"
+        )))
+    }
+    let parse = |bytes: &[u8]| {
+        serde_json::from_slice::<Value>(bytes)
+            .map_err(|_| Error::Conflict("资源在提交后再次变化，且不支持字段级回退；未覆盖".into()))
+    };
+    let (base, after, now) = (parse(original)?, parse(applied)?, parse(current)?);
+    let merged = merge(Some(&base), Some(&after), Some(&now), "")?
+        .ok_or_else(|| Error::Conflict("无法回退整个资源".into()))?;
+    Ok(serde_json::to_vec_pretty(&merged)?)
+}
+
+fn validate_plan(plan: &MutationPlan) -> Result<()> {
+    plan.execution.validate()?;
+    if plan.resources.is_empty() || plan.staged_outputs.is_empty() {
+        return Err(Error::Config(
+            "mutation plan must bind resources and staged outputs".into(),
+        ));
+    }
+    if plan.execution.risk == RiskLevel::Irreversible
+        && !plan.compensation.restore_snapshots.is_empty()
+    {
+        return Err(Error::Config(
+            "irreversible plans cannot claim snapshot compensation".into(),
+        ));
+    }
+    if plan.execution.verification == VerificationMode::None {
+        return Err(Error::Config("mutations require verification".into()));
+    }
+    Ok(())
+}
+
+fn insert_event(db: &Connection, operation_id: &str, kind: &str, payload: &Value) -> Result<()> {
+    db.execute(
+        "INSERT INTO runtime_operation_events(operation_id,kind,payload,created_at) VALUES(?1,?2,?3,?4)",
+        params![operation_id, kind, payload.to_string(), crate::runtime::types::now()],
+    )?;
+    Ok(())
+}
+
+fn read_payloads<T: serde::de::DeserializeOwned>(
+    connection: &Mutex<Connection>,
+    sql: &str,
+) -> Result<Vec<T>> {
+    let db = connection.lock().unwrap();
+    let mut statement = db.prepare(sql)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|payload| serde_json::from_str(&payload).map_err(Error::from))
+        .collect()
+}
+
+#[cfg(test)]
+mod rollback_merge_tests {
+    use super::*;
+    #[test]
+    fn undo_keeps_later_independent_fields_and_missing_distinct_from_null() {
+        let before = json!({"team":"a","nested":{"x":1},"removed":null});
+        let applied = json!({"team":"b","nested":{"x":1,"new":true}});
+        let current = json!({"team":"b","nested":{"x":2,"new":true},"later":42});
+        let restored = restore_json_changes(
+            &serde_json::to_vec(&before).unwrap(),
+            &serde_json::to_vec(&applied).unwrap(),
+            &serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&restored).unwrap(),
+            json!({"team":"a","nested":{"x":2},"removed":null,"later":42})
+        );
+    }
+    #[test]
+    fn overlapping_changes_are_reported_without_overwriting() {
+        assert!(
+            restore_json_changes(br#"{"team":"a"}"#, br#"{"team":"b"}"#, br#"{"team":"c"}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("/team")
+        );
+    }
+}

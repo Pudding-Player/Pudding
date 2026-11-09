@@ -1,0 +1,53 @@
+import { ProductUiProvider } from "./appearance/UiProvider";
+import { Component, StrictMode, type ErrorInfo, type ReactNode } from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+import { ContextMenu } from "./components/shell/ContextMenu";
+import { DesktopReady } from "./components/shell/DesktopReady";
+import { WindowResizeHandles } from "./components/shell/TitleBar";
+import { framelessWindow } from "./ipc/api";
+import { initAnalytics } from "./app/analytics";
+import "@pudding/ui/styles.css";
+import "@pudding/ui/motion.css";
+
+initAnalytics();
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error?: Error }
+> {
+  public override state: { error?: Error } = {};
+
+  public static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  public override componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Pudding render failed", error, info);
+  }
+
+  public override render() {
+    if (this.state.error) {
+      return (
+        <main className="fatal-error">
+          <h1>界面载入失败</h1>
+          <pre>{this.state.error.message}</pre>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <ProductUiProvider>
+      {framelessWindow() && <WindowResizeHandles />}
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+      <ContextMenu />
+      <DesktopReady />
+    </ProductUiProvider>
+  </StrictMode>,
+);

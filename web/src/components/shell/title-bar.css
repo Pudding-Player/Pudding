@@ -1,0 +1,150 @@
+/* 自绘标题栏。高度记在 :root 上（默认 0），侧栏和遮罩按同一个变量让位。
+   窗口圆角由 DWM 切（Windows 11），Windows 10 上是方角。 */
+:root[data-frameless="true"] {
+  --title-bar-height: 32px;
+}
+
+.title-bar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  /* 侧栏顶部条带是空 padding，条带横跨整个窗口；融进界面，不画底色和下边线。 */
+  z-index: 300;
+  width: 100%;
+  height: var(--title-bar-height);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  /* 窗口控制贴物理右缘，不随界面语言方向翻转。 */
+  direction: ltr;
+  /* 裁掉按钮悬停底色的方角。 */
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  app-region: drag;
+}
+
+.title-bar-controls {
+  app-region: no-drag;
+  display: flex;
+  height: 100%;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.title-bar-button {
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--secondary);
+}
+
+.title-bar-button:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.title-bar-button:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.title-bar-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.title-bar-glyph {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1;
+}
+
+.window-resize-handle {
+  app-region: no-drag;
+  position: fixed;
+  z-index: 301;
+  touch-action: none;
+  user-select: none;
+}
+
+:root[data-maximized="true"] .window-resize-handle {
+  display: none;
+}
+
+.resize-left,
+.resize-right {
+  top: 12px;
+  bottom: 12px;
+  width: 6px;
+  cursor: ew-resize;
+}
+
+.resize-left {
+  left: 0;
+}
+
+.resize-right {
+  right: 0;
+}
+
+.resize-top,
+.resize-bottom {
+  left: 12px;
+  right: 12px;
+  height: 6px;
+  cursor: ns-resize;
+}
+
+.resize-top {
+  top: 0;
+}
+
+.resize-bottom {
+  bottom: 0;
+}
+
+.resize-topLeft,
+.resize-topRight,
+.resize-bottomLeft,
+.resize-bottomRight {
+  width: 12px;
+  height: 12px;
+}
+
+.resize-topLeft,
+.resize-bottomRight {
+  cursor: nwse-resize;
+}
+
+.resize-topRight,
+.resize-bottomLeft {
+  cursor: nesw-resize;
+}
+
+.resize-topLeft,
+.resize-topRight {
+  top: 0;
+}
+
+.resize-bottomLeft,
+.resize-bottomRight {
+  bottom: 0;
+}
+
+.resize-topLeft,
+.resize-bottomLeft {
+  left: 0;
+}
+
+.resize-topRight,
+.resize-bottomRight {
+  right: 0;
+}

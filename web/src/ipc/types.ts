@@ -1,0 +1,547 @@
+import type { GroupLayout } from "../session/conversation-groups";
+
+export interface ModelInfo {
+  id: string;
+  name: string;
+  protocol: string;
+  model: string;
+  baseUrl: string;
+  active: boolean;
+  timeoutMs?: number;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  auth?: "auto" | "apiKey" | "bearer";
+  promptCache?: boolean;
+  apiKey?: string | null;
+}
+
+export interface SkillInfo {
+  name: string;
+  displayName?: string | null;
+  description: string;
+  source: string;
+  tags: string[];
+  enabled?: boolean;
+  alwaysLoad?: boolean;
+  /** 需要哪些领域提供方在线。 */
+  requiresProviders?: string[];
+  /** 用户开关是开的、依赖也在线，这份说明才进入模型上下文；`enabled` 只表示用户没有关掉它。 */
+  available?: boolean;
+  unavailableReason?: string;
+  instructions?: string;
+}
+export interface PluginInfo {
+  manifest: { id: string; name: string; version: string; description?: string };
+  status: string;
+  configuredEnabled?: boolean;
+  error?: string;
+  /** 随产品提供的宿主插件，不能移除。 */
+  host?: boolean;
+  bundled?: boolean;
+}
+export interface ConversationInfo {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  pinned?: boolean;
+  archived?: boolean;
+  /** 会话绑定的模型。已被删除时由运行时回落到默认模型。 */
+  modelId?: string | null;
+  taskCount?: number;
+}
+export interface ToolInfo {
+  name: string;
+  /** 界面显示的名字，由工具自己的定义给出；为空则退回 `name`。 */
+  label: string;
+  description: string;
+  source: string;
+}
+export interface MemoryExperience {
+  title?: string;
+  intent: string;
+  summary: string;
+  keywords: string[];
+  conditions: string[];
+  steps: {
+    tool: string;
+    methodId: string | null;
+    action: string;
+    inputRoles: Record<string, string>;
+  }[];
+  verification: string[];
+  pitfalls: string[];
+  anchors: string[];
+}
+
+export interface MemoryEntry {
+  id: string;
+  experience: MemoryExperience;
+  revision: number;
+  userEdited: boolean;
+  validationState: "candidate" | "verified";
+  sourceConversationId: string;
+  updatedAt: string;
+}
+
+export interface MessageInfo {
+  role: "system" | "user" | "assistant" | "tool" | "context";
+  content: string;
+  createdAt?: string;
+  /** Persisted assistant text replaces deltas through this event sequence. */
+  runId?: string | null;
+  streamBoundary?: number | null;
+  toolCallId?: string;
+  toolCalls?: Array<{ id: string; name: string; arguments: unknown }>;
+  /**
+   * 模型的推理内容，只有推理类模型返回，`text` 可能为空。
+   * `blocks` 是回传给提供方的原样载荷，界面不解析它。
+   */
+  reasoning?: {
+    protocol: string;
+    blocks?: unknown[];
+    text?: string;
+  };
+}
+export interface ContextActivity {
+  id: number;
+  runId: string;
+  state: "running" | "completed" | "failed";
+}
+
+export interface TaskInfo {
+  revision?: number;
+  id: string;
+  conversationId: string;
+  prompt: string;
+  state:
+    | "answered"
+    | "queued"
+    | "preflighting"
+    | "blocked"
+    | "running"
+    | "deciding"
+    | "executing"
+    | "awaitingUser"
+    | "awaitingApproval"
+    | "waitingJob"
+    | "verifying"
+    | "recovering"
+    | "succeeded"
+    | "partial"
+    | "needsReview"
+    | "failed"
+    | "cancelling"
+    | "cancelled";
+  result?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  modelId?: string | null;
+  inputTokens?: number;
+  outputTokens?: number;
+  usageEstimated?: boolean;
+  contextTokens?: number;
+  contextWindow?: number;
+  contextCompacted?: boolean;
+  /** 底层模型服务返回的缓存计数，只用于诊断协议。 */
+  cacheReadTokens?: number;
+  /** Agent 确认复用的稳定提示前缀，不依赖厂商 usage 字段。 */
+  promptCacheHitTokens?: number;
+  promptCacheHit?: boolean;
+  promptCacheReason?: string | null;
+  source?:
+    | { kind: "agent" }
+    | { kind: "savedStrategy"; strategyId: string }
+    | { kind: "savedWorkflow"; workflowId: string; workflowRevision: number }
+    | {
+        kind: "boundWorkflow";
+        workflowId: string;
+        workflowRevision: number;
+        origin: string;
+      };
+}
+
+/** 快捷任务的可见状态。文案与主按钮由后端给出。 */
+export type DefinitionState =
+  | "draft"
+  | "invalid"
+  | "readyUnverified"
+  | "readyVerified"
+  | "unavailable"
+  | "deleted";
+
+export interface TaskSummary {
+  shortcut?: ShortcutBinding | null;
+  id: string;
+  name: string;
+  description: string;
+  state: DefinitionState;
+  stateLabel: string;
+  actionLabel: string;
+  runnable: boolean;
+  pinned: boolean;
+  sourceConversationId?: string | null;
+  sourceTitleSnapshot: string;
+  sourceDeleted: boolean;
+  publishedRevision?: number | null;
+  revision?: number | null;
+  modelUsage: "none" | "possible" | "unknown";
+  /** 运行不调用模型。只有全部依赖都声明为确定性工具时才为真。 */
+  zeroToken: boolean;
+  nodeCount: number;
+  updatedAt: string;
+  lastRunId?: string | null;
+  issue?: string | null;
+}
+
+export interface ShortcutProposal {
+  id?: string | null;
+  name: string;
+  description: string;
+  binding: ShortcutBinding;
+}
+
+export interface ShortcutBinding {
+  action?: { tool: string; arguments: Record<string, unknown> };
+  steps?: Array<{
+    title: string;
+    prepare?: Array<{ tool: string; arguments: Record<string, unknown> }>;
+    action?: { tool: string; arguments: Record<string, unknown> };
+    waitSeconds?: number;
+  }>;
+  prepare?: Array<{ tool: string; arguments: Record<string, unknown> }>;
+  targetName: string;
+  applicationName: string;
+}
+
+export interface TaskIssue {
+  nodeId: string;
+  message: string;
+}
+
+export interface TaskValidation {
+  modelUsage: "none" | "possible" | "unknown";
+  nodeCount: number;
+  maxExpansion: number;
+  issues: TaskIssue[];
+  missingBindings: string[];
+}
+
+export interface WorkflowDetail {
+  summary: TaskSummary;
+  definition: {
+    id: string;
+    name: string;
+    description: string;
+    sourceConversationId?: string | null;
+    sourceTitleSnapshot: string;
+    publishedRevision?: number | null;
+    draftRevision?: number | null;
+    pinned: boolean;
+    lastRunId?: string | null;
+    createdAt: string;
+    updatedAt: string;
+  };
+  revision?: {
+    revision: number;
+    modelUsage: string;
+    validation: TaskValidation;
+  } | null;
+  runs: string[];
+}
+export interface StrategyStep {
+  id: string;
+  title: string;
+  capabilityId: string;
+  arguments: Record<string, unknown>;
+  dependsOn: string[];
+}
+export interface SavedStrategy {
+  id: string;
+  name: string;
+  sourceRunId: string;
+  plan: { revision: number; goal: string; steps: StrategyStep[] };
+  createdAt: string;
+  updatedAt: string;
+  lastRunId?: string;
+}
+export interface ResourceInfo {
+  id: string;
+  providerId: string;
+  kind: string;
+  displayName: string;
+  version: string;
+  capabilities: string[];
+  presentation?: unknown;
+}
+export interface OperationInfo {
+  id: string;
+  title: string;
+  providerId: string;
+  state: string;
+  risk: string;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+}
+export interface WorkflowInfo {
+  id: string;
+  revision: number;
+  name: string;
+  description: string;
+  steps: Array<{ id: string; title: string; tool: string }>;
+  unattended: "allowed" | "forbidden";
+  verifiedAt: string;
+  verifiedFromRun: string;
+}
+
+/** 一次运行的步骤结果，供「运行记录」详情展开。 */
+export interface StepRecord {
+  id: string;
+  title: string;
+  outcome: string;
+  detail?: string;
+}
+export interface DiagnosticInfo {
+  id: string;
+  providerId: string;
+  kind:
+    | "userConfiguration"
+    | "thirdPartyScript"
+    | "hostApplication"
+    | "environment"
+    | "unknown";
+  title: string;
+  summary: string;
+  evidenceIds: string[];
+  repairAction?: unknown;
+  createdAt: string;
+}
+export interface NotificationInfo {
+  id: string;
+  kind: string;
+  title: string;
+  message: string;
+  createdAt: string;
+}
+export interface RunEvent {
+  sequence: number;
+  conversationId: string;
+  runId: string;
+  kind: string;
+  data: Record<string, unknown>;
+}
+/** 结构化问答的选项，与 runtime `questions::QuestionOption` 对齐。 */
+export interface QuestionOptionInfo {
+  label: string;
+  description?: string;
+}
+/** 单个问题：id 用于答复回填，header/question 是给人看的文案。 */
+export interface QuestionInfo {
+  id: string;
+  header: string;
+  question: string;
+  options?: QuestionOptionInfo[];
+}
+/** 一次 open 的问答请求。旧版事件只有 question:string，没有这个形状。 */
+export interface QuestionRequestInfo {
+  requestId: string;
+  runId: string;
+  questions: QuestionInfo[];
+  createdAt?: string;
+  /** 旧事件回放（只有 question:string）合成的请求：没有 journal 记录，答复走 run.input。 */
+  legacy?: boolean;
+}
+/** 答复载荷：题目 id → 字符串数组，与 `run.question.answer` 契约一致。 */
+export type QuestionAnswers = Record<string, { answers: string[] }>;
+
+/** 审批卡的可读摘要，由 Rust 侧从业务参数整理；UI 不做任何特例映射。 */
+export interface ApprovalPresentation {
+  title: string;
+  summary: string;
+  changes: Array<{ label: string; value: string }>;
+}
+export interface RunApproval {
+  id: string;
+  runId: string;
+  request: {
+    methodId?: string;
+    instanceId?: string;
+    arguments?: unknown;
+    binding?: { description?: string };
+    presentation?: ApprovalPresentation;
+  };
+  expiresAt: number;
+}
+/** 审批级别。文案由运行时给出。 */
+export interface PermissionLevel {
+  value: string;
+  label: string;
+  description: string;
+}
+export interface PermissionState {
+  mode: string;
+  label: string;
+  description: string;
+  levels: PermissionLevel[];
+}
+
+/** bootstrap 缺 permission 字段时垫一层，文案与 `PermissionMode::levels` 对齐。 */
+export const PREVIEW_PERMISSION: PermissionState = {
+  mode: "askEach",
+  label: "请求审批",
+  description: "每次修改前都问你一次",
+  levels: [
+    {
+      value: "planOnly",
+      label: "只读",
+      description: "只查询和阅读，任何修改都不执行",
+    },
+    {
+      value: "askEach",
+      label: "请求审批",
+      description: "每次修改前都问你一次",
+    },
+    {
+      value: "fullAccess",
+      label: "完全控制",
+      description: "一律直接执行，不再询问。删除和大范围覆盖也直接做",
+    },
+  ],
+};
+
+export function withPermission(bootstrap: Bootstrap): Bootstrap {
+  if (bootstrap.permission?.mode && bootstrap.permission.levels?.length) {
+    return bootstrap;
+  }
+  return { ...bootstrap, permission: PREVIEW_PERMISSION };
+}
+
+export interface Bootstrap {
+  /** 配置文件的绝对路径。 */
+  configPath: string;
+  models: ModelInfo[];
+  skills: SkillInfo[];
+  plugins: PluginInfo[];
+  tools: ToolInfo[];
+  runtimeToolLabels?: Record<string, string>;
+  conversations: ConversationInfo[];
+  conversationGroups?: GroupLayout;
+  tasks: TaskInfo[];
+  strategies: SavedStrategy[];
+  workflows: TaskSummary[];
+  operations: OperationInfo[];
+  resources: ResourceInfo[];
+  diagnostics: DiagnosticInfo[];
+  notifications: NotificationInfo[];
+  permission: PermissionState;
+  bridge: {
+    enabled: boolean;
+    connected: boolean;
+    baseUrl: string;
+    launchSilently?: boolean;
+    autoStart?: boolean;
+    error?: string;
+    /** 进程里驻留的桥落后于安装目录：重启 BetterGI 后重连生效。 */
+    stale?: boolean;
+  };
+}
+
+export interface BridgeMethod {
+  methodId: string;
+  displayName: string;
+  group: string;
+  summary: string;
+  effect: string;
+  callable: boolean;
+  unavailableReason?: string;
+  catalogVersion?: string;
+  executionMode?: string;
+  requiresConfirmation?: boolean;
+  whenToUse?: string[];
+  sideEffects?: string[];
+  parameters?: Array<{
+    name: string;
+    type: string;
+    required: boolean;
+    description: string;
+  }>;
+}
+export interface BridgeGuide {
+  title: string;
+  purpose: string;
+  whenToUse: string[];
+  preconditions: string[];
+  sideEffects: string[];
+  resultMeaning: string;
+  verification: string;
+  rollback: string;
+  examples: unknown[];
+  documentationSource: string;
+  sourceReference?: string;
+}
+export interface BridgeMethodDetail extends BridgeMethod {
+  guide?: BridgeGuide;
+  inputSchema: {
+    type?: string;
+    properties?: Record<
+      string,
+      { type?: string; description?: string; enum?: unknown[] }
+    >;
+    required?: string[];
+  };
+  outputSchema?: unknown;
+  errors?: string[];
+}
+export interface BridgeCatalog {
+  total: number;
+  items?: BridgeMethod[];
+  methods?: BridgeMethod[];
+  offset?: number;
+  nextOffset?: number | null;
+  groups?: Array<{ id: string; count: number }>;
+  catalogVersion?: string;
+}
+
+export interface RecoveryPreview {
+  mode: "fields" | "full";
+  online: boolean;
+  changeId: string;
+  recordVersion: string;
+  currentVersion: string;
+  configPath: string;
+  planId?: string;
+  paths: string[];
+  hostRunning?: boolean;
+  canApply: boolean;
+  requiresExit?: boolean;
+  reason?: string | null;
+  differences: Array<{
+    path: string;
+    label: string;
+    current: unknown;
+    restore: unknown;
+    changed: boolean;
+    laterChanged?: boolean;
+    related?: boolean;
+  }>;
+}
+export interface RecoveryRecord {
+  fields?: Array<{ path: string; label: string }>;
+  kind?: "change" | "snapshot" | "unavailable";
+  hostExecutable?: string;
+  snapshotDigest?: string;
+  parentChangeId?: string | null;
+  canPreview?: boolean;
+  changeId: string;
+  recordVersion?: string;
+  currentVersion?: string;
+  state?: string;
+  createdAt?: string;
+  operation?: string;
+  configPath?: string;
+  paths: string[];
+  canRestore: boolean;
+  reason?: string;
+}

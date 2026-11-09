@@ -1,0 +1,721 @@
+//! 工具契约与扩展：工具注册表，以及技能、插件、MCP 三类扩展来源。
+
+pub mod mcp;
+pub mod mcp_server;
+pub mod plugins;
+pub mod providers;
+pub mod skills;
+
+use std::{collections::HashMap, sync::Arc};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::error::{Error, Result};
+
+const fn default_result_limit() -> usize {
+    12_000
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolEffect {
+    ReadOnly,
+    InternalState,
+    LocalWrite,
+    GameWrite,
+    ExternalWrite,
+    #[serde(alias = "write")]
+    Write,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RiskLevel {
+    Observe,
+    Low,
+    #[default]
+    Standard,
+    High,
+    Irreversible,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConcurrencyMode {
+    ReadParallel,
+    ResourceExclusive,
+    GameExclusive,
+    #[default]
+    Serial,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IdempotencyMode {
+    SafeRetry,
+    OriginalKeyOnly,
+    #[default]
+    NeverRetry,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CancellationMode {
+    Reliable,
+    Cooperative,
+    #[default]
+    Unconfirmed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VerificationMode {
+    None,
+    State,
+    Job,
+    Plugin,
+    Human,
+    #[default]
+    Required,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompensationMode {
+    None,
+    SnapshotRestore,
+    Plugin,
+    #[default]
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnattendedPolicy {
+    Allowed,
+    #[default]
+    Forbidden,
+}
+
+/// 一次写入的实际影响从哪里取值。缺省 `unknown` 表示无法界定。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScopeKind {
+    #[default]
+    Unknown,
+    /// 逐个配置叶字段。
+    Fields,
+    /// 按对象计数：`scopeTarget` 指向的参数是对象 ID 列表。
+    Objects,
+    /// 删除用户内容。
+    Delete,
+    /// 整份替换或重置。
+    Whole,
+}
+
+/// 工具是否可能调用语言模型。缺省是 `unknown`，声明为 `none` 必须由可信契约给出。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsage {
+    None,
+    Possible,
+    #[default]
+    Unknown,
+}
+
+impl ModelUsage {
+    pub fn is_deterministic(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// 模型可见性由本次运行的真实观测决定，执行权限仍在调用边界检查。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolExposure {
+    #[default]
+    Always,
+    AfterRead,
+    AfterWrite,
+    OnDemand,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct ToolExecution {
+    /// 当前权限允许时直接提供契约，避免基础通道能力还要先检索目录。
+    #[serde(default)]
+    pub prompt_visible: bool,
+    pub effect: ToolEffect,
+    pub effect_is_dynamic: bool,
+    pub concurrency_safe: bool,
+    pub risk: RiskLevel,
+    pub concurrency: ConcurrencyMode,
+    pub lease_scope: Option<String>,
+    pub idempotency: IdempotencyMode,
+    pub cancellation: CancellationMode,
+    pub verification: VerificationMode,
+    pub compensation: CompensationMode,
+    pub timeout_ms: u64,
+    pub unattended: UnattendedPolicy,
+    pub max_result_chars: usize,
+    pub deferred: bool,
+    pub always_load: bool,
+    pub exposure: ToolExposure,
+    pub search_hint: Option<String>,
+    /// 可由检索批次调用的只读搜索入口；不是任意工具的批量执行许可。
+    pub search_provider: bool,
+    pub model_usage: ModelUsage,
+    pub scope: ScopeKind,
+    /// 受影响目标所在的参数名。
+    #[serde(default)]
+    pub scope_target: Option<String>,
+    /// 读取目标当前内容所用的只读工具；与 `Fields` 搭配。
+    #[serde(default)]
+    pub scope_reader: Option<String>,
+    pub goal_observation: Option<Box<GoalObservationSpec>>,
+    /// 适配器声明分页与查询身份，运行时不从工具名或业务文本猜测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<Box<PaginationSpec>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PaginationSpec {
+    pub has_more: String,
+    pub next_cursor: String,
+    pub cursor_argument: String,
+    pub initial_cursor: Value,
+    pub identity: Vec<String>,
+}
+
+/// Typed native evidence for an information goal, declared by the adapter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalObservationSpec {
+    pub pointer: String,
+    pub meaning: String,
+    pub when_true: String,
+    pub when_false: String,
+}
+
+impl Default for ToolExecution {
+    fn default() -> Self {
+        Self {
+            prompt_visible: false,
+            effect: ToolEffect::Unknown,
+            effect_is_dynamic: false,
+            concurrency_safe: false,
+            risk: RiskLevel::Standard,
+            concurrency: ConcurrencyMode::Serial,
+            lease_scope: None,
+            idempotency: IdempotencyMode::NeverRetry,
+            cancellation: CancellationMode::Unconfirmed,
+            verification: VerificationMode::Required,
+            compensation: CompensationMode::Required,
+            timeout_ms: 30_000,
+            unattended: UnattendedPolicy::Forbidden,
+            max_result_chars: default_result_limit(),
+            deferred: true,
+            always_load: false,
+            exposure: ToolExposure::Always,
+            search_hint: None,
+            search_provider: false,
+            model_usage: ModelUsage::Unknown,
+            scope: ScopeKind::Unknown,
+            scope_target: None,
+            scope_reader: None,
+            goal_observation: None,
+            pagination: None,
+        }
+    }
+}
+
+impl ToolExecution {
+    pub fn read_only() -> Self {
+        Self {
+            effect: ToolEffect::ReadOnly,
+            concurrency_safe: true,
+            risk: RiskLevel::Observe,
+            concurrency: ConcurrencyMode::ReadParallel,
+            idempotency: IdempotencyMode::SafeRetry,
+            cancellation: CancellationMode::Reliable,
+            verification: VerificationMode::None,
+            compensation: CompensationMode::None,
+            unattended: UnattendedPolicy::Allowed,
+            // 内置只读工具都在本机完成。
+            model_usage: ModelUsage::None,
+            ..Self::default()
+        }
+    }
+
+    pub fn can_run_concurrently(&self) -> bool {
+        self.effect == ToolEffect::ReadOnly
+            && self.concurrency_safe
+            && matches!(
+                self.concurrency,
+                ConcurrencyMode::ReadParallel | ConcurrencyMode::Serial
+            )
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let Some(spec) = &self.pagination
+            && (self.effect != ToolEffect::ReadOnly
+                || self.effect_is_dynamic
+                || spec.identity.is_empty()
+                || [&spec.has_more, &spec.next_cursor, &spec.cursor_argument]
+                    .into_iter()
+                    .chain(spec.identity.iter())
+                    .any(|p| !p.starts_with('/')))
+        {
+            return Err(Error::Config(
+                "分页契约必须绑定明确的只读工具、JSON指针与查询身份".into(),
+            ));
+        }
+        if self.search_provider && (self.effect != ToolEffect::ReadOnly || self.effect_is_dynamic) {
+            return Err(Error::Config("批量检索入口必须是效果明确的只读工具".into()));
+        }
+        if self.max_result_chars < 256 || self.max_result_chars > 1_000_000 {
+            return Err(Error::Config(
+                "工具结果上限必须在 256 到 1000000 字符之间".into(),
+            ));
+        }
+        if self.concurrency_safe && self.effect != ToolEffect::ReadOnly {
+            return Err(Error::Config("只有明确只读的工具可以声明并发安全".into()));
+        }
+        if self.concurrency == ConcurrencyMode::ReadParallel && self.effect != ToolEffect::ReadOnly
+        {
+            return Err(Error::Config("只有只读工具可以声明 readParallel".into()));
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > 86_400_000 {
+            return Err(Error::Config("工具超时必须在 1 毫秒到 24 小时之间".into()));
+        }
+        if self.risk == RiskLevel::Irreversible && self.unattended == UnattendedPolicy::Allowed {
+            return Err(Error::Config("不可逆工具不能用于无人值守运行".into()));
+        }
+        if self.always_load && self.deferred {
+            return Err(Error::Config(
+                "工具不能同时声明 alwaysLoad 与 deferred".into(),
+            ));
+        }
+        if self
+            .search_hint
+            .as_ref()
+            .is_some_and(|hint| hint.trim().is_empty() || hint.len() > 160)
+        {
+            return Err(Error::Config("工具 searchHint 无效".into()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDefinition {
+    pub name: String,
+    /// 面向用户的名字，界面在执行记录里显示它；为空时退回工具名。
+    #[serde(default)]
+    pub label: String,
+    pub description: String,
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_version: Option<String>,
+    #[serde(default)]
+    pub execution: ToolExecution,
+}
+
+pub trait Tool: Send + Sync {
+    fn definition(&self) -> ToolDefinition;
+    fn call(&self, arguments: &Value) -> Result<Value>;
+    /// 宿主声明本批交付动作的先后；缺省保持模型给出的调用顺序。
+    fn response_priority(&self) -> i32 {
+        0
+    }
+    /// 通道声明需要在实际交付前检查的展示内容；只提供草稿，不执行动作。
+    fn presentation(&self, _arguments: &Value) -> Option<Value> {
+        None
+    }
+    /// 交付对象和路由参数，不含待组织的正文；不按相同字符串猜参数位置。
+    fn presentation_context(&self, _arguments: &Value) -> Option<Value> {
+        None
+    }
+    fn presents_content(&self) -> bool {
+        false
+    }
+    /// 已经向用户交付结果的宿主工具可以结束本轮，避免继续生成重复发言。
+    fn turn_completion(&self, _result: &Value) -> Option<String> {
+        None
+    }
+    /// 宿主已有内容提交回执；只用于避免重复交付，不证明整项目标已完成或接收端已看到。
+    fn has_delivery_receipt(&self, _result: &Value) -> bool {
+        false
+    }
+    fn call_async(
+        self: Arc<Self>,
+        arguments: Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>>
+    where
+        Self: 'static,
+    {
+        Box::pin(async move {
+            tokio::select! {
+                _ = cancel.cancelled()=>Err(Error::Conflict("工具停止状态尚未确认".into())),
+                result=tokio::task::spawn_blocking(move||self.call(&arguments))=>result.map_err(|_|Error::Tool("工具进程异常退出".into()))?,
+            }
+        })
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct ToolRegistry {
+    tools: HashMap<String, Arc<dyn Tool>>,
+    mcp_connections: HashMap<String, Arc<mcp::McpClient>>,
+}
+
+impl ToolRegistry {
+    pub fn tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
+    }
+
+    pub fn response_priority(&self, name: &str) -> i32 {
+        self.tools
+            .get(name)
+            .map_or(0, |tool| tool.response_priority())
+    }
+
+    pub fn turn_completion(&self, name: &str, result: &Value) -> Option<String> {
+        self.tools
+            .get(name)
+            .and_then(|tool| tool.turn_completion(result))
+    }
+    pub(crate) fn register_mcp(
+        &mut self,
+        provider: &str,
+        server: &str,
+        client: Arc<mcp::McpClient>,
+    ) {
+        self.mcp_connections
+            .insert(format!("{provider}/{server}"), client);
+    }
+
+    pub(crate) fn mcp_connection(
+        &self,
+        provider: &str,
+        server: &str,
+    ) -> Option<Arc<mcp::McpClient>> {
+        self.mcp_connections
+            .get(&format!("{provider}/{server}"))
+            .cloned()
+    }
+
+    pub async fn call_async(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Value> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| Error::Tool("工具未注册".into()))?
+            .clone();
+        let definition = tool.definition();
+        let issues = validate(args, &definition.input_schema, "$");
+        if !issues.is_empty() {
+            // 只反馈字段路径与校验消息（最多 5 条），让缺必填字段一次可定位；
+            // 不回显整份 args，避免凭证或大对象进入错误文本。
+            let details = issues
+                .iter()
+                .take(5)
+                .map(|issue| {
+                    let path = issue.get("path").and_then(Value::as_str).unwrap_or("$");
+                    let message = issue
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    format!("{path}：{message}")
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            return Err(Error::Tool(format!("工具参数不符合契约：{details}")));
+        }
+        let value = tool.call_async(args.clone(), cancel).await?;
+        validate_output(&value, definition.output_schema.as_ref())?;
+        Ok(value)
+    }
+    pub fn register<T: Tool + 'static>(&mut self, tool: T) -> Result<()> {
+        let definition = tool.definition();
+        definition.execution.validate()?;
+        validate_definition(&definition)?;
+        let name = definition.name;
+        if !valid_name(&name) {
+            return Err(Error::Tool(format!("工具名不合法：{name}")));
+        }
+        if self.tools.contains_key(&name) {
+            return Err(Error::Tool(format!("工具名重复：{name}")));
+        }
+        self.tools.insert(name, Arc::new(tool));
+        Ok(())
+    }
+
+    pub fn register_shared(&mut self, tool: Arc<dyn Tool>) -> Result<()> {
+        let definition = tool.definition();
+        definition.execution.validate()?;
+        validate_definition(&definition)?;
+        let name = definition.name;
+        if !valid_name(&name) {
+            return Err(Error::Tool(format!("工具名不合法：{name}")));
+        }
+        if self.tools.contains_key(&name) {
+            return Err(Error::Tool(format!("工具名重复：{name}")));
+        }
+        self.tools.insert(name, tool);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        let mut result = self
+            .tools
+            .values()
+            .map(|tool| tool.definition())
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| left.name.cmp(&right.name));
+        result
+    }
+
+    pub fn call(&self, name: &str, arguments: &Value) -> Value {
+        let Some(tool) = self.tools.get(name) else {
+            return json!({"ok":false,"error":{"code":"TOOL_NOT_FOUND","message":format!("未注册的工具：{name}")}});
+        };
+        let definition = tool.definition();
+        let issues = validate(arguments, &definition.input_schema, "$");
+        if !issues.is_empty() {
+            return json!({"ok":false,"error":{"code":"INVALID_ARGUMENT","message":"工具参数不符合契约","details":issues}});
+        }
+        match tool.call(arguments).and_then(|value| {
+            validate_output(&value, definition.output_schema.as_ref())?;
+            Ok(value)
+        }) {
+            Ok(value) => json!({"ok":true,"value":value}),
+            Err(error) => {
+                json!({"ok":false,"error":{"code":"TOOL_EXECUTION_FAILED","message":error.to_string()}})
+            }
+        }
+    }
+}
+
+fn validate_definition(definition: &ToolDefinition) -> Result<()> {
+    jsonschema::validator_for(&definition.input_schema)
+        .map_err(|_| Error::Config("工具输入 Schema 无效".into()))?;
+    if let Some(schema) = &definition.output_schema {
+        jsonschema::validator_for(schema)
+            .map_err(|_| Error::Config("工具输出 Schema 无效".into()))?;
+    }
+    Ok(())
+}
+
+fn validate_output(value: &Value, schema: Option<&Value>) -> Result<()> {
+    if schema.is_some_and(|schema| !validate(value, schema, "$").is_empty()) {
+        return Err(Error::Tool("工具返回结果不符合输出契约".into()));
+    }
+    Ok(())
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') && index > 0
+        })
+}
+
+pub fn validate(value: &Value, schema: &Value, path: &str) -> Vec<Value> {
+    match jsonschema::validator_for(schema) {
+        Ok(validator) => validator
+            .iter_errors(value)
+            .take(32)
+            .map(|e| {
+                // jsonschema 的 Display 会回显参数原值（如 "\"secret\" is not of
+                // type..."），不能进入错误反馈；只保留字段路径与约束本身。
+                // required 的 Display 固定为 "{property} is a required property"
+                // （不含实例值），且其 schema_path 末段即 "required"，据此识别；
+                // 其余分支只用 schema 路径末段作为约束关键词。
+                let schema_path = e.schema_path.to_string();
+                let last = schema_path
+                    .rsplit('/')
+                    .find(|s| !s.is_empty())
+                    .unwrap_or_default();
+                let message = if last == "required" {
+                    e.to_string()
+                } else {
+                    format!("不满足 {last} 约束（{schema_path}）")
+                };
+                json!({"path":format!("{path}{}",e.instance_path),"message":message})
+            })
+            .collect(),
+        Err(error) => vec![json!({"path":path,"message":format!("工具 Schema 无效：{error}")})],
+    }
+}
+
+pub struct FunctionTool<F>
+where
+    F: Fn(&Value) -> Result<Value> + Send + Sync,
+{
+    definition: ToolDefinition,
+    function: F,
+}
+
+impl<F> FunctionTool<F>
+where
+    F: Fn(&Value) -> Result<Value> + Send + Sync,
+{
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        source: impl Into<String>,
+        function: F,
+    ) -> Self {
+        Self {
+            definition: ToolDefinition {
+                name: name.into(),
+                label: String::new(),
+                description: description.into(),
+                input_schema,
+                output_schema: None,
+                source: source.into(),
+                provider_version: None,
+                execution: ToolExecution::default(),
+            },
+            function,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.definition.label = label.into();
+        self
+    }
+
+    pub fn with_execution(mut self, execution: ToolExecution) -> Self {
+        self.definition.execution = execution;
+        self
+    }
+
+    pub fn with_provider_version(mut self, version: Option<String>) -> Self {
+        self.definition.provider_version = version;
+        self
+    }
+
+    pub fn with_output_schema(mut self, output_schema: Option<Value>) -> Self {
+        self.definition.output_schema = output_schema;
+        self
+    }
+}
+
+impl<F> Tool for FunctionTool<F>
+where
+    F: Fn(&Value) -> Result<Value> + Send + Sync,
+{
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+    fn call(&self, arguments: &Value) -> Result<Value> {
+        (self.function)(arguments)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn schema_requiring_path() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        })
+    }
+
+    // 校验失败必须反馈具体字段路径且不调用工具本体；错误保持可恢复的 Error::Tool
+    #[tokio::test]
+    async fn call_async_invalid_args_report_field_and_skip_tool() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(FunctionTool::new(
+                "demo.read",
+                "演示读取",
+                schema_requiring_path(),
+                "test",
+                move |_args| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"ok": true}))
+                },
+            ))
+            .expect("register");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let err = registry
+            .call_async("demo.read", &json!({"other": 1}), cancel)
+            .await
+            .expect_err("must fail");
+        let message = err.to_string();
+        // 缺必填能定位到具体字段，而不是笼统一句
+        assert!(message.contains("path"), "message: {message}");
+        assert!(message.contains("工具参数不符合契约"));
+        // 工具本体未被调用
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // 可恢复错误（Error::Tool），不是取消/冲突类
+        assert!(matches!(err, Error::Tool(_)));
+
+        // 参数合规时正常执行，不误伤
+        let ok = registry
+            .call_async(
+                "demo.read",
+                &json!({"path": "a.txt"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("valid call");
+        assert_eq!(ok, json!({"ok": true}));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // 校验消息不得回显参数原值（如把实际值嵌进类型错误文案）
+    #[test]
+    fn validate_message_does_not_echo_instance_value() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"token": {"type": "integer"}},
+            "required": ["token"]
+        });
+        let issues = validate(&json!({"token": "s3cretValue"}), &schema, "$");
+        assert!(!issues.is_empty());
+        let text = serde_json::to_string(&issues).unwrap();
+        assert!(!text.contains("s3cretValue"), "echoed value: {text}");
+        assert!(text.contains("token"));
+        // 必填缺失只含属性名
+        let missing = validate(&json!({}), &schema, "$");
+        let missing_text = serde_json::to_string(&missing).unwrap();
+        assert!(missing_text.contains("token"));
+        assert!(missing_text.contains("required"));
+    }
+}

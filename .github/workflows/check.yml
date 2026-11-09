@@ -1,0 +1,46 @@
+name: check
+
+on:
+  # 分支推送与 PR 各自执行一次。tag 不在这里触发：发布流程会以 workflow_call
+  # 调它一次并要求发布作业依赖它，否则同一个 tag 会执行两遍。
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    env:
+      TEMP: ${{ github.workspace }}\target\ci\tmp
+      TMP: ${{ github.workspace }}\target\ci\tmp
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare build cache
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: npm install
+      - run: npm run check:repo
+      - run: npm run build
+      - run: npm test
+      - run: cargo fmt --all -- --check
+      - run: cargo check
+      - run: cargo check --no-default-features
+      - name: Validate bridge data migration
+        run: dotnet run --project bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --data-migration
+      - name: Validate workspace PowerShell execution
+        run: cargo test --no-default-features --lib runtime::workspace::tests::shell_ -- --nocapture
+      - name: Validate BGI progressive disclosure
+        run: |
+          dotnet run --project bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --check-interfaces bgi-bridge/dev/bgi-method-metadata.json
+          python bgi-bridge/dev/feature-guide-builder.py --check
+          cargo test --no-default-features --lib

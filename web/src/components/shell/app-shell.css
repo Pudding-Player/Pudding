@@ -1,0 +1,869 @@
+.app-shell {
+  --sidebar-user-width: 248px;
+  --sidebar-width: 248px;
+  --sidebar-motion: var(--motion-slow) var(--ease-enter);
+  --details-width: clamp(280px, 28vw, 336px);
+  --layout-gap: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  height: 100%;
+  /* 自绘标题栏是固定层，这里让出它的高度。 */
+  padding-top: var(--title-bar-height);
+  overflow: hidden;
+  color: var(--text);
+  background: var(--sidebar);
+}
+.app-shell[data-resizing="true"] .app-sidebar,
+.app-shell[data-resizing="true"] .app-main {
+  transition: none;
+}
+.app-sidebar-peek {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: 10px;
+  /* 压过标题栏：折叠态下唤出条贴着窗口左缘，否则摸不到。 */
+  z-index: 310;
+}
+.app-sidebar-resize {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 10px;
+  height: 100%;
+  z-index: 6;
+  cursor: col-resize;
+  touch-action: none;
+}
+.app-sidebar-resize::after {
+  content: "";
+  position: absolute;
+  top: calc(var(--title-bar-height) + 12px);
+  right: 3px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--secondary) 65%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--motion-fast) var(--ease-standard);
+}
+.app-sidebar-resize:hover::after,
+.app-shell[data-resizing="true"] .app-sidebar-resize::after {
+  opacity: 1;
+}
+:root[data-sidebar-resizing="true"],
+:root[data-sidebar-resizing="true"] * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+.app-shell[data-collapsed="true"] {
+  --sidebar-width: 0px;
+}
+.app-shell[data-drawer="true"] .app-sidebar {
+  box-shadow: var(--shadow);
+  /* 抽屉铺开时盖过标题栏，顶部内容完整可点。 */
+  z-index: 320;
+}
+.app-shell[data-drawer="true"] .app-main {
+  z-index: 0;
+}
+.app-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  padding: 0;
+  border: 0;
+  background: #0005;
+}
+.app-sidebar {
+  /* 停靠与悬浮用同一层固定侧栏加 translateX 定位。背景顶到窗口上缘，
+     内容仍从标题栏条带下方开始，收起按钮与页首的展开按钮同一高度。 */
+  position: fixed;
+  inset: 0 auto 0 0;
+  padding-top: var(--title-bar-height);
+  z-index: 80;
+  width: min(var(--sidebar-user-width), 88vw);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--sidebar);
+  border-right: 0;
+  white-space: nowrap;
+  transform: translateX(-100%);
+  pointer-events: none;
+  transition: transform var(--sidebar-motion);
+}
+.app-shell:not([data-collapsed="true"]) .app-sidebar,
+.app-shell[data-drawer="true"] .app-sidebar {
+  transform: translateX(0);
+  pointer-events: auto;
+}
+.app-brand {
+  app-region: drag;
+  height: calc(var(--header-height) + 8px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px var(--sidebar-pad-x) 0;
+  flex-shrink: 0;
+}
+.brand-mark {
+  width: 22px;
+  height: 22px;
+  overflow: visible;
+}
+.app-brand .icon-button {
+  app-region: no-drag;
+  margin-left: auto;
+  color: var(--muted);
+}
+.app-new {
+  margin: 4px var(--sidebar-pad-x) 8px;
+  min-height: var(--control-height);
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: var(--surface);
+  border-radius: var(--radius);
+  text-align: left;
+  font-size: var(--font-body);
+}
+.app-new:hover {
+  background: var(--hover);
+}
+.app-nav {
+  display: grid;
+  gap: 2px;
+  padding: 0 var(--sidebar-pad-x);
+  flex-shrink: 0;
+}
+.app-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: var(--control-height);
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--secondary);
+  text-align: left;
+  font-size: var(--font-body);
+}
+.app-nav-item:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.app-nav-item.is-active {
+  background: var(--selected);
+  color: var(--text);
+  font-weight: 600;
+}
+.app-nav-icon {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+.app-sidebar-tools {
+  flex-shrink: 0;
+  display: grid;
+  gap: 6px;
+  padding: 10px var(--sidebar-pad-x) 8px;
+}
+.app-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-height: var(--control-height);
+  padding: 0;
+  font-size: var(--font-label);
+  font-weight: 500;
+  color: var(--muted);
+}
+.app-section-head .icon-button[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--selected);
+}
+.app-sidebar-tools .search-field {
+  max-width: none;
+}
+.app-conversations {
+  overflow-anchor: none;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 var(--sidebar-pad-x) 8px;
+}
+.app-conversations ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 1px;
+}
+.app-conversations .app-group-chats-inner {
+  padding: 1px 0 0 24px;
+}
+.app-row-lead {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+}
+.app-group {
+  --row-bg: transparent;
+}
+.app-group-head {
+  display: flex;
+  align-items: center;
+  position: relative;
+  min-width: 0;
+  --row-bg: transparent;
+  border-radius: var(--radius);
+  background: var(--row-bg);
+  cursor: grab;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+.app-group-head:hover {
+  --row-bg: var(--hover);
+}
+.app-group.is-drop > .app-group-head {
+  --row-bg: var(--selected);
+}
+.app-group-disclose {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: var(--control-height);
+  color: var(--secondary);
+}
+.app-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--control-height);
+  padding: 0 10px 0 4px;
+  border: 0;
+  border-radius: var(--radius);
+  text-align: left;
+  background: transparent;
+  font-size: var(--font-body);
+  color: var(--secondary);
+  cursor: inherit;
+}
+.app-group-head:hover .app-group-toggle,
+.app-group-head:hover .app-group-disclose,
+.app-group.is-drop .app-group-toggle,
+.app-group.is-drop .app-group-disclose {
+  color: var(--text);
+}
+.app-group-chevron {
+  width: 14px;
+  height: 12px;
+  color: currentColor;
+}
+.app-group-toggle small {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--font-label);
+  transition: opacity var(--motion-fast) var(--ease-standard);
+}
+.app-group-head:hover .app-group-toggle small {
+  opacity: 0;
+}
+.app-group-chats {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows var(--motion-base) var(--ease-enter);
+}
+.app-group-chats.is-collapsed {
+  grid-template-rows: 0fr;
+  pointer-events: none;
+}
+.app-group-chats-inner {
+  min-height: 0;
+  overflow: hidden;
+  list-style: none;
+  margin: 0;
+  padding: 1px 0 0 24px;
+  display: grid;
+  gap: 1px;
+  opacity: 1;
+  transition: opacity var(--motion-fast) var(--ease-standard);
+}
+.app-group-chats.is-collapsed .app-group-chats-inner {
+  opacity: 0;
+}
+.app-conversations li.is-source {
+  opacity: 0;
+  pointer-events: none;
+}
+.app-group.is-source {
+  opacity: 0.4;
+}
+.app-conversations li[data-sd-slot="conversation"],
+.app-group-head {
+  cursor: grab;
+}
+.app-drop-end {
+  min-height: 12px;
+}
+.app-drag-ghost {
+  position: fixed;
+  z-index: 240;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  padding: 0 10px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--font-body);
+  box-shadow: var(--shadow);
+}
+:root[data-sd-dragging],
+:root[data-sd-dragging] * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+/* 行背景变量由 li 给出，按钮与浮层共用。
+   只选直接子按钮：操作区的 icon-button 不能吃到 width: 100%。 */
+.app-conversations li > button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--control-height);
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius);
+  text-align: left;
+  background: var(--row-bg);
+  font-size: var(--font-body);
+  color: var(--secondary);
+  overflow: hidden;
+}
+.app-conversations li:hover > button {
+  color: var(--text);
+}
+.app-conversations li.is-current > button {
+  color: var(--text);
+  font-weight: 400;
+}
+.app-conversation-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-status {
+  display: block;
+  width: 6px;
+  height: 6px;
+  margin-inline: 0;
+  border-radius: 50%;
+  background: var(--text);
+  flex-shrink: 0;
+}
+.conversation-status.running {
+  animation: pulse 1.5s ease infinite;
+}
+.app-sidebar-status {
+  flex-shrink: 0;
+  margin: 0 var(--sidebar-pad-x);
+  padding: 2px 0 6px;
+}
+.app-sidebar-foot {
+  flex-shrink: 0;
+  margin: 0 var(--sidebar-pad-x);
+  padding: 8px 0 var(--sidebar-pad-x);
+  border-top: 1px solid var(--border);
+}
+.app-account-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.app-account-slot {
+  flex: 1;
+  min-width: 0;
+}
+.app-account {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 0;
+  padding: 8px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+.app-account:hover,
+.app-account[aria-expanded="true"] {
+  background: var(--hover);
+}
+.app-account-avatar {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+.app-account-avatar svg,
+.app-account-avatar img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+}
+.app-account-copy {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  line-height: 1.25;
+}
+.app-account-copy strong,
+.app-account-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-account-copy strong {
+  font-size: var(--font-body);
+  font-weight: 600;
+}
+.app-account-copy small {
+  color: var(--muted);
+  font-size: var(--font-label);
+}
+.app-account-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  display: grid;
+  gap: 0;
+  width: auto;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  white-space: normal;
+  transform-origin: bottom center;
+  animation: menu-rise var(--motion-base) var(--ease-enter) both;
+}
+.app-account-menu-prefs {
+  display: grid;
+  gap: 4px;
+  padding: 2px 6px 8px;
+}
+.app-account-menu-prefs .setting-row.is-compact {
+  min-height: var(--control-height);
+  padding: 0;
+  gap: 8px;
+}
+.app-account-menu-links {
+  display: grid;
+  gap: 1px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+.app-account-more {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: var(--control-height);
+  margin: 0;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--font-body);
+  text-align: left;
+}
+.app-account-more .button-icon {
+  width: 16px;
+  height: 16px;
+  color: var(--secondary);
+}
+.app-account-more:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.app-connection {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: var(--control-height);
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  font-size: var(--font-body);
+  color: var(--secondary);
+}
+.app-connection:hover {
+  background: var(--hover);
+}
+.app-connection small {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--font-label);
+}
+.app-main {
+  min-width: 0;
+  min-height: 0;
+  margin-left: var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px var(--layout-gap) var(--layout-gap);
+  overflow: hidden;
+  transition: margin-left var(--sidebar-motion);
+}
+.app-header {
+  height: var(--header-height);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 var(--page-padding);
+  border: 1px solid var(--border);
+  border-radius: var(--layout-radius);
+  background: var(--surface);
+}
+.app-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.app-header-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+/* 折叠时页首补的两个按钮：常驻并随侧栏同拍展开，不再瞬间弹出。 */
+.app-header-fold {
+  display: flex;
+  gap: 4px;
+  overflow: hidden;
+  max-width: 0;
+  opacity: 0;
+  transition:
+    max-width 320ms var(--ease-enter),
+    opacity 240ms var(--ease-standard);
+}
+.app-header-fold[data-collapsed="true"] {
+  max-width: 72px;
+  opacity: 1;
+}
+.app-header h1 {
+  font-size: var(--font-body);
+  font-weight: 550;
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-banner {
+  margin: 0;
+  padding: 10px 30px;
+  background: var(--subtle);
+  font-size: 15px;
+}
+.app-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 0px;
+  column-gap: 0;
+  overflow: hidden;
+  transition:
+    grid-template-columns 320ms var(--ease-enter),
+    column-gap 320ms var(--ease-enter);
+}
+.app-shell[data-details="true"] .app-body {
+  grid-template-columns: minmax(0, 1fr) var(--details-width);
+  column-gap: var(--layout-gap);
+}
+.app-view {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--layout-radius);
+  background: var(--surface);
+}
+.app-view .page-sheet {
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  /* 网格默认的 align-content: stretch 会把剩余高度摊到每一行上，这里按内容排。 */
+  align-content: start;
+}
+.app-nav-badge {
+  margin-left: auto;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--solid);
+  color: var(--inverse);
+  font-size: var(--font-label);
+  line-height: 16px;
+  text-align: center;
+}
+.app-conversations li {
+  position: relative;
+  min-width: 0;
+  --row-bg: transparent;
+}
+.app-conversations li[data-sd-slot="conversation"] {
+  display: flex;
+  align-items: center;
+  border-radius: var(--radius);
+  background: var(--row-bg);
+}
+.app-conversations li[data-sd-slot="conversation"] > button {
+  flex: 1;
+  width: auto;
+  background: transparent;
+}
+.app-conversations li:hover {
+  --row-bg: var(--hover);
+}
+.app-conversations li.is-current,
+.app-conversations li.is-current:hover {
+  --row-bg: var(--selected);
+}
+.app-conversations li.app-group,
+.app-conversations li.app-group:hover,
+.app-conversations li.app-group.is-current,
+.app-conversations li.app-group.is-current:hover {
+  --row-bg: transparent;
+}
+/* 留出操作区的宽度，隐藏时也不改变标题的截断位置。 */
+.app-conversation-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1px;
+  margin-inline-end: 4px;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity var(--motion-fast) var(--ease-standard),
+    visibility var(--motion-fast) var(--ease-standard);
+}
+.app-conversations li:hover > .app-conversation-actions,
+.app-conversations li:focus-within > .app-conversation-actions,
+.app-group-head:hover > .app-conversation-actions {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+.app-conversation-actions .icon-button {
+  width: 24px;
+  height: 24px;
+}
+.app-conversation-actions .button-icon {
+  width: 14px;
+  height: 14px;
+}
+.app-conversation-pin {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.app-conversation-flag {
+  font-style: normal;
+  font-size: var(--font-label);
+  color: var(--muted);
+}
+.app-conversation-empty {
+  padding: 10px;
+  font-size: var(--font-meta);
+  color: var(--muted);
+}
+.app-context-menu {
+  position: fixed;
+  z-index: 240;
+  display: grid;
+  gap: 1px;
+  min-width: 148px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.app-context-menu button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: var(--control-height);
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--font-body);
+  text-align: left;
+}
+.app-context-menu button:hover,
+.app-context-menu button:focus-visible {
+  background: var(--hover);
+}
+.app-conversations .sd-inline-rename,
+.app-group > .sd-inline-rename {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: var(--control-height);
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+}
+::view-transition-group(*) {
+  animation-duration: var(--motion-fast);
+  animation-timing-function: var(--ease-enter);
+}
+body[data-theme-reveal="true"] {
+  background: var(--surface);
+}
+body[data-theme-reveal="true"] .app-conversations li,
+body[data-theme-reveal="true"] .app-group {
+  view-transition-name: none !important;
+}
+body[data-theme-reveal="true"]::view-transition-group(root) {
+  animation: theme-scope-hold 560ms linear;
+}
+@keyframes theme-scope-hold {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+  }
+}
+body[data-theme-reveal="true"]::view-transition-old(root) {
+  animation: none;
+  mix-blend-mode: normal;
+  z-index: 1;
+}
+body[data-theme-reveal="true"]::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+  z-index: 2;
+}
+body[data-theme-reveal-layer="old"]::view-transition-old(root) {
+  z-index: 2;
+}
+body[data-theme-reveal-layer="old"]::view-transition-new(root) {
+  z-index: 1;
+}
+@media (max-width: 1000px) {
+  .app-header {
+    padding: 0 22px;
+  }
+}
+
+/* Account controls share the same compact, softly squared geometry. */
+.app-account-menu {
+  padding: 8px;
+  border-radius: var(--layout-radius);
+  box-shadow:
+    0 12px 36px #00000014,
+    0 2px 6px #00000008;
+}
+.app-account-menu-prefs {
+  gap: 8px;
+  padding: 4px 4px 12px;
+}
+.app-account-menu-prefs .setting-row.is-compact {
+  min-height: 34px;
+}
+.app-account-menu .app-theme-switch {
+  height: 32px;
+  --theme-knob: 24px;
+  --theme-inset: 4px;
+}
+.app-account-menu-links {
+  gap: 3px;
+  padding-top: 8px;
+}
+.app-account-menu .app-account-more {
+  min-height: 36px;
+  padding: 0 8px;
+  border-radius: 8px;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+}
+.app-account-menu .app-account-more .button-icon {
+  width: 17px;
+  height: 17px;
+}
+.app-account-menu :is(button, [role="switch"]):focus-visible {
+  outline: 2px solid var(--chat-user);
+  outline-offset: 2px;
+}
+.app-account-menu[data-open="false"] {
+  pointer-events: none;
+}
+:root[data-theme="dark"] .app-account-menu {
+  box-shadow:
+    0 12px 36px #0006,
+    0 2px 6px #0003;
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-account-menu,
+  .app-account-menu[data-open="false"] {
+    animation: none;
+  }
+  .app-account-menu .app-account-more {
+    transition: none;
+  }
+}

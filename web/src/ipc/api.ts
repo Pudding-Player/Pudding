@@ -1,0 +1,478 @@
+import type {
+  Bootstrap,
+  BridgeCatalog,
+  BridgeMethodDetail,
+  ConversationInfo,
+  MessageInfo,
+  RecoveryRecord,
+  RecoveryPreview,
+  RunEvent,
+  SavedStrategy,
+  TaskInfo,
+  PermissionState,
+  TaskSummary,
+  TaskValidation,
+  WorkflowDetail,
+  QuestionAnswers,
+  MemoryEntry,
+  MemoryExperience,
+} from "./types";
+import type { GroupLayout } from "../session/conversation-groups";
+import { withPermission } from "./types";
+import { dictOf } from "../i18n";
+import { readLocale } from "../appearance/locale";
+
+declare global {
+  interface Window {
+    ipc?: { postMessage(message: string): void };
+    __PUDDING_DESKTOP__?: boolean;
+    __PUDDING_FRAMELESS__?: boolean;
+    __puddingReceive?: (message: NativeMessage) => void;
+    __puddingWindow?: (state: WindowState) => void;
+  }
+}
+
+/** 窗口是否由界面自绘标题栏：读桌面壳注入的无边框标记。 */
+export function framelessWindow() {
+  return (
+    typeof window !== "undefined" && Boolean(window.__PUDDING_FRAMELESS__)
+  );
+}
+
+export interface WindowState {
+  maximized: boolean;
+}
+
+interface NativeMessage {
+  kind: "response" | "event";
+  id?: string;
+  ok?: boolean;
+  result?: unknown;
+  error?: { message: string };
+}
+
+interface IpcEnvelope<T> {
+  id: string;
+  ok: boolean;
+  result?: T;
+  error?: { message: string };
+}
+
+export function eventsReadParams(
+  conversationId: string,
+  after: number,
+  nativeIpc = typeof window !== "undefined" && Boolean(window.ipc),
+) {
+  return nativeIpc
+    ? { conversationId, after, waitMs: 20_000 }
+    : { conversationId, after };
+}
+
+export function devIpcUrl(dev = import.meta.env.DEV) {
+  return dev ? "/ipc" : "http://127.0.0.1:47124/ipc";
+}
+
+const pending = new Map<
+  string,
+  {
+    resolve(value: unknown): void;
+    reject(reason: unknown): void;
+    timer: number;
+  }
+>();
+
+const nativeEventListeners = new Set<
+  (name: string, payload: unknown) => void
+>();
+
+/** 桌面壳推送的原生事件（如急停）。仅桌面壳里有发送方。 */
+export function subscribeNativeEvents(
+  listener: (name: string, payload: unknown) => void,
+) {
+  nativeEventListeners.add(listener);
+  return () => {
+    nativeEventListeners.delete(listener);
+  };
+}
+
+window.__puddingReceive = (message) => {
+  if (message.kind === "event" && message.id) {
+    nativeEventListeners.forEach((listener) =>
+      listener(message.id as string, message.result),
+    );
+    return;
+  }
+  if (message.kind !== "response" || !message.id) return;
+  const entry = pending.get(message.id);
+  if (!entry) return;
+  window.clearTimeout(entry.timer);
+  pending.delete(message.id);
+  if (message.ok) entry.resolve(message.result);
+  else
+    entry.reject(
+      new Error(
+        message.error?.message ?? dictOf(readLocale()).ipc.requestFailed,
+      ),
+    );
+};
+
+async function invokeHttp<T>(
+  id: string,
+  method: string,
+  params: Record<string, unknown>,
+  timeoutMs: number,
+) {
+  let response: Response;
+  try {
+    response = await fetch(devIpcUrl(), {
+      signal: AbortSignal.timeout(timeoutMs),
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, method, params }),
+    });
+  } catch (error) {
+    throw new Error(
+      error instanceof DOMException &&
+        ["TimeoutError", "AbortError"].includes(error.name)
+        ? dictOf(readLocale()).ipc.timeout
+        : dictOf(readLocale()).ipc.unreachable,
+    );
+  }
+  const text = await response.text();
+  if (!text) {
+    throw new Error(
+      response.ok
+        ? dictOf(readLocale()).ipc.unreachable
+        : `本地服务返回 HTTP ${response.status}`,
+    );
+  }
+  const envelope = JSON.parse(text) as IpcEnvelope<T>;
+  if (!response.ok || !envelope.ok) {
+    throw new Error(
+      envelope.error?.message ?? `本地服务返回 HTTP ${response.status}`,
+    );
+  }
+  return envelope.result as T;
+}
+
+export function invoke<T>(
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<T> {
+  const id = crypto.randomUUID();
+  const timeoutMs =
+    method === "release.download"
+      ? 200_000
+      : method === "release.check"
+        ? 20_000
+        : method === "bridge.setEnabled"
+          ? 100_000
+          : method === "events.read" || method === "model.list"
+            ? 30_000
+            : 15_000;
+  const ipc = window.ipc;
+  if (!ipc) return invokeHttp<T>(id, method, params, timeoutMs);
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(dictOf(readLocale()).ipc.timeout));
+    }, timeoutMs);
+    pending.set(id, { resolve: (value) => resolve(value as T), reject, timer });
+    try {
+      ipc.postMessage(JSON.stringify({ id, method, params }));
+    } catch (error) {
+      window.clearTimeout(timer);
+      pending.delete(id);
+      reject(error);
+    }
+  });
+}
+
+/** 窗口控制不等回执：拖动期间原生主线程在系统的移动循环里，回执要等循环结束才发得出来。 */
+function sendWindow(method: string) {
+  window.ipc?.postMessage(
+    JSON.stringify({ id: crypto.randomUUID(), method, params: {} }),
+  );
+}
+
+export const api = {
+  memoryState: () =>
+    invoke<{ enabled: boolean; revision?: string; reviewing?: boolean }>(
+      "memory.state",
+    ),
+  setMemoryEnabled: (enabled: boolean) =>
+    invoke<{ enabled: boolean }>("memory.setEnabled", { enabled }),
+  memories: () =>
+    invoke<{ entries: { entry: MemoryEntry; compatible: boolean }[] }>(
+      "memory.list",
+    ),
+  memoryUpdate: (id: string, revision: number, experience: MemoryExperience) =>
+    invoke("memory.update", { id, revision, experience }),
+  memoryDelete: (id: string, revision: number) =>
+    invoke("memory.delete", { id, revision }),
+  releaseState: () => invoke<ReleaseState>("release.state"),
+  releaseCheck: () => invoke<ReleaseState>("release.check"),
+  releaseConfigure: (analyticsEnabled: boolean, channel: string) =>
+    invoke<ReleaseState>("release.configure", { analyticsEnabled, channel }),
+  releaseDownload: () => invoke<ReleaseState>("release.download"),
+  releaseInstall: () => invoke<{ installing: boolean }>("release.install"),
+  bootstrap: () => invoke<Bootstrap>("bootstrap").then(withPermission),
+  submitTask: (
+    prompt: string,
+    conversationId?: string,
+    clientKey: string = crypto.randomUUID(),
+    modelId?: string | null,
+    interruptActive?: boolean,
+  ) =>
+    invoke<TaskInfo>("task.submit", {
+      prompt,
+      clientKey,
+      ...(conversationId ? { conversationId } : {}),
+      // 新对话里先挑好的模型随第一条消息一起生效；留空表示跟随默认模型。
+      ...(modelId ? { modelId } : {}),
+      // 有本轮运行时由发送方打断后接续，而不是排队等旧回复结束。
+      ...(interruptActive ? { interruptActive: true } : {}),
+    }),
+  task: (id: string) => invoke<TaskInfo>("task.get", { id }),
+  tasks: () => invoke<TaskInfo[]>("task.list"),
+  supplement: (
+    id: string,
+    content: string,
+    clientKey: string = crypto.randomUUID(),
+  ) => invoke("run.input", { id, content, clientKey }),
+  approve: (id: string, approved: boolean) =>
+    invoke("approval.respond", { id, approved }),
+  /** 结构化问答的专用答复通道，不产生用户聊天消息。 */
+  answerQuestion: (
+    id: string,
+    requestId: string,
+    answers: QuestionAnswers,
+    clientKey: string = crypto.randomUUID(),
+  ) =>
+    invoke<{ accepted: boolean; recorded: boolean }>("run.question.answer", {
+      id,
+      requestId,
+      answers,
+      clientKey,
+    }),
+  events: (conversationId: string, after: number) =>
+    invoke<{ events: RunEvent[]; snapshotRequired?: boolean }>(
+      "events.read",
+      eventsReadParams(conversationId, after, Boolean(window.ipc)),
+    ),
+  cancelTask: (id: string) => invoke<TaskInfo>("task.cancel", { id }),
+  resumeTask: (id: string) => invoke<TaskInfo>("task.resume", { id }),
+  conversation: (id: string) =>
+    invoke<{
+      id: string;
+      messages: MessageInfo[];
+      runs?: TaskInfo[];
+      contextActivities?: import("./types").ContextActivity[];
+      contextActivityBoundary?: number;
+      questionRequests?: import("./types").QuestionRequestInfo[];
+    }>("conversation.get", { id }),
+  useModel: (id: string) =>
+    invoke<{ activeModel: string }>("model.use", { id }),
+  deleteModel: (id: string) =>
+    invoke<{ deleted: boolean; activeModel: string }>("model.delete", { id }),
+  permission: () => invoke<PermissionState>("permission.get"),
+  setPermission: (mode: string) =>
+    invoke<{ mode: string; label: string }>("permission.set", { mode }),
+  saveModel: (model: {
+    id: string;
+    name: string;
+    protocol: string;
+    model: string;
+    baseUrl: string;
+    apiKey: string;
+    timeoutMs?: number;
+    contextWindow?: number;
+    maxOutputTokens?: number;
+    auth?: string;
+    promptCache?: boolean;
+  }) => invoke<{ saved: boolean }>("model.save", { model }),
+  listModels: (probe: {
+    id?: string;
+    protocol: string;
+    baseUrl: string;
+    apiKey: string;
+    auth?: string;
+    modelsUrl?: string;
+  }) =>
+    invoke<{ models: string[]; contextWindows?: Record<string, number> }>(
+      "model.list",
+      probe,
+    ),
+  setSkillEnabled: (name: string, enabled: boolean) =>
+    invoke<{ enabled: boolean }>("skill.setEnabled", { name, enabled }),
+  setPluginEnabled: (id: string, enabled: boolean) =>
+    invoke<{ restartRequired: boolean }>("plugin.setEnabled", { id, enabled }),
+  bridgeState: () => invoke<unknown>("bridge.state"),
+  bridgeStatus: () => invoke<Bootstrap["bridge"]>("bridge.status"),
+  bridgeRecovery: () =>
+    invoke<{
+      hostRunning: boolean;
+      runningTargets?: string[];
+      records: RecoveryRecord[];
+    }>("bridge.recoveryList"),
+  bridgeRecoveryStatus: (targets: string[]) =>
+    invoke<{ runningTargets: string[] }>("bridge.recoveryStatus", { targets }),
+  previewBridgeRecovery: (
+    record: RecoveryRecord,
+    mode: "fields" | "full",
+    paths: string[],
+  ) =>
+    invoke<RecoveryPreview>("bridge.recoveryPreview", {
+      changeId: record.changeId,
+      recordVersion: record.recordVersion,
+      mode,
+      paths,
+    }),
+  restoreBridgeConfig: (preview: RecoveryPreview) =>
+    invoke<{ restored: boolean; online: boolean; recoveryChangeId: string }>(
+      "bridge.restore",
+      { ...preview },
+    ),
+  bridgeCatalog: (query = "", group = "", offset = 0) =>
+    invoke<BridgeCatalog>("bridge.catalog", { query, group, offset }),
+  bridgeDescribe: (methodId: string) =>
+    invoke<BridgeMethodDetail>("bridge.describe", { methodId }),
+  setBridgeEnabled: (enabled: boolean) =>
+    invoke<{ enabled: boolean; warning?: string }>("bridge.setEnabled", {
+      enabled,
+    }),
+  setBridgeLaunchSilently: (silently: boolean) =>
+    invoke<{ launchSilently: boolean }>("bridge.setLaunchSilently", {
+      silently,
+    }),
+  setBridgeLaunchBehavior: (autoStart: boolean, launchSilently: boolean) =>
+    invoke<{ autoStart: boolean; launchSilently: boolean }>(
+      "bridge.setLaunchBehavior",
+      {
+        autoStart,
+        launchSilently,
+      },
+    ),
+  installPlugin: (path: string) =>
+    invoke<{ id: string }>("plugin.install", { path }),
+  installSkill: (path: string) =>
+    invoke<{ name: string }>("skill.install", { path }),
+  removePlugin: (id: string) => invoke("plugin.remove", { id }),
+  reloadExtensions: () => invoke("extensions.reload"),
+  extractStrategy: (runId: string, name: string) =>
+    invoke<SavedStrategy>("strategy.extract", { runId, name }),
+  extractWorkflow: (runId: string, name: string) =>
+    invoke("workflow.extract", { runId, name }),
+  runStrategy: (id: string) =>
+    invoke<TaskInfo>("strategy.run", {
+      id,
+      clientKey: crypto.randomUUID(),
+    }),
+  executeOperation: (id: string) => invoke("operation.execute", { id }),
+  rollbackOperation: (id: string) => invoke("operation.rollback", { id }),
+
+  configRead: () => invoke<{ path: string; content: string }>("config.read"),
+  configWrite: (content: string) =>
+    invoke<{ saved: boolean }>("config.write", { content }),
+  conversations: (search = "", includeArchived = false) =>
+    invoke<ConversationInfo[]>("conversation.list", {
+      search,
+      includeArchived,
+      limit: 200,
+    }),
+  renameConversation: (id: string, title: string) =>
+    invoke("conversation.rename", { id, title }),
+  saveConversationGroups: (layout: GroupLayout) =>
+    invoke("conversation.groups.save", {
+      groups: layout.groups,
+      membership: layout.membership,
+    }),
+  pinConversation: (id: string, pinned: boolean) =>
+    invoke("conversation.setPinned", { id, pinned }),
+  archiveConversation: (id: string, archived: boolean) =>
+    invoke("conversation.setArchived", { id, archived }),
+  setConversationModel: (id: string, modelId: string) =>
+    invoke("conversation.setModel", { id, modelId }),
+  deleteConversation: (id: string, confirmed = false) =>
+    invoke<{
+      requiresConfirmation?: boolean;
+      affects?: { title: string; taskCount: number };
+      keeps?: string;
+      deleted?: boolean;
+      messages?: number;
+      runs?: number;
+      tasksKept?: number;
+    }>("conversation.delete", { id, confirmed }),
+
+  workflowList: (conversationId?: string) =>
+    invoke<TaskSummary[]>("workflow.list", {
+      ...(conversationId ? { conversationId } : {}),
+    }),
+  workflowGet: (id: string) => invoke<WorkflowDetail>("workflow.get", { id }),
+  workflowValidate: (id: string, draftRevision?: number) =>
+    invoke<{
+      validation: TaskValidation;
+      publishable: boolean;
+      zeroToken: boolean;
+      modelUsage: string;
+    }>("workflow.validate", {
+      id,
+      ...(draftRevision ? { draftRevision } : {}),
+    }),
+  workflowPublish: (
+    id: string,
+    draftRevision: number,
+    expectedPublishedRevision?: number,
+  ) =>
+    invoke<{ publishedRevision: number; zeroToken: boolean }>(
+      "workflow.publish",
+      {
+        id,
+        draftRevision,
+        ...(expectedPublishedRevision ? { expectedPublishedRevision } : {}),
+      },
+    ),
+  runWorkflow: (id: string, expectedPublishedRevision?: number) =>
+    invoke<TaskInfo>("workflow.run", {
+      id,
+      clientKey: crypto.randomUUID(),
+      ...(expectedPublishedRevision ? { expectedPublishedRevision } : {}),
+    }),
+  renameWorkflow: (id: string, name: string) =>
+    invoke("workflow.rename", { id, name }),
+  pinWorkflow: (id: string, pinned: boolean) =>
+    invoke("workflow.pin", { id, pinned }),
+  deleteWorkflow: (id: string) =>
+    invoke<{ deleted: boolean; activeRuns: string[]; historyKept: boolean }>(
+      "workflow.delete",
+      { id },
+    ),
+  copyWorkflow: (id: string) => invoke<{ id: string }>("workflow.copy", { id }),
+
+  windowDrag: () => sendWindow("window.drag"),
+  windowMinimize: () => sendWindow("window.minimize"),
+  windowToggleMaximize: () => sendWindow("window.toggleMaximize"),
+  windowClose: () => sendWindow("window.close"),
+  windowState: () => sendWindow("window.state"),
+
+  trayState: () => invoke<{ enabled: boolean }>("tray.state"),
+  traySetEnabled: (enabled: boolean) =>
+    invoke<{ saved: boolean }>("tray.setEnabled", { enabled }),
+};
+
+export interface ReleaseState {
+  currentVersion: string;
+  currentChannel: "test" | "stable";
+  channel: "test" | "stable";
+  analyticsEnabled: boolean;
+  downloaded: boolean;
+  release: null | {
+    version: string;
+    channel: string;
+    url: string;
+    size: number;
+    sha256: string;
+    notes: string;
+    publishedAt: string;
+  };
+}

@@ -1,0 +1,59 @@
+# Build, delivery and validation output
+node_modules/
+/target/
+/dist/
+/test/
+/.tmp/
+coverage/
+__pycache__/
+*.py[cod]
+
+# Android toolchain state
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+/android/**/build/
+/packages/ui-android/build/
+
+# Application data and credentials
+/.sleepy-doll/
+/.pudding/
+/user/
+*.runtime.lock
+pudding*.config.json
+!pudding.config.example.json
+pudding.config.*.tmp
+sleepy-doll*.config.json
+sleepy-doll.config.*.tmp
+*.v1.backup.json
+*.json.*.tmp
+*.db
+*.db-shm
+*.db-wal
+*.log
+.pudding-dev.json
+.sleepy-doll-dev.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+
+# Editor state
+.idea/
+.vscode/
+.cursor/
+.zcode/
+.dev-vite.sh
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Video production and legacy output (maintained locally, not part of the open-source repo)
+/video/
+.video-build.lock
+/bgi-bridge/target-check/
+/.retired/
+/.staging-*/

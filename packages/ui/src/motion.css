@@ -1,0 +1,242 @@
+:root {
+  --motion-fast: 120ms;
+  --motion-base: 240ms;
+  --motion-slow: 320ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-enter: cubic-bezier(0.22, 0.08, 0.16, 1);
+}
+
+.motion-switch {
+  min-width: 0;
+  min-height: 0;
+}
+.app-view > .motion-switch {
+  width: 100%;
+  height: 100%;
+}
+
+.bridge-api-detail,
+.run-approval,
+.run-error,
+.notice,
+.inline-error {
+  animation: panel-enter var(--motion-base) var(--ease-enter) both;
+}
+
+button,
+[role="button"],
+[data-ui="select-trigger"],
+[data-ui="select-option"],
+.record,
+.list-item,
+.extension-row,
+.flow-card,
+.bridge-api-row,
+.recovery-row,
+input,
+textarea {
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard),
+    opacity var(--motion-fast) var(--ease-standard),
+    box-shadow var(--motion-fast) var(--ease-standard),
+    transform var(--motion-fast) var(--ease-standard),
+    scale var(--motion-fast) var(--ease-standard);
+}
+
+:is(
+    .primary-action,
+    .secondary-action,
+    .runtime-action,
+    .subtle-action,
+    .icon-button
+  ):active:not(:disabled) {
+  scale: 0.975;
+  transition-duration: 70ms;
+}
+
+.list-item:has(> .list-item-trigger:hover),
+.list-item[data-list-surface="true"]:not([data-busy]):hover:not(
+    :has(
+      :is(
+        button:not(.list-item-trigger),
+        a,
+        input,
+        select,
+        textarea,
+        [role="menu"]
+      ):hover
+    )
+  ) {
+  background-color: var(--hover);
+}
+
+.list-item:has(> .list-item-trigger:active),
+.list-item[data-list-surface="true"]:not([data-busy]):active:not(
+    :has(
+      :is(
+        button:not(.list-item-trigger),
+        a,
+        input,
+        select,
+        textarea,
+        [role="menu"]
+      ):active
+    )
+  ) {
+  background-color: var(--selected);
+  transition-duration: 70ms;
+}
+
+.switch::after {
+  transition:
+    transform var(--motion-base) var(--ease-enter),
+    background-color var(--motion-fast) var(--ease-standard),
+    box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.conversation-status.running {
+  animation: status-breathe 1.4s var(--ease-standard) infinite;
+}
+
+[data-ui="select-menu"] {
+  transform-origin: top center;
+  animation: menu-enter var(--motion-base) var(--ease-enter) both;
+}
+
+details > :not(summary) {
+  animation: disclosure-enter var(--motion-base) var(--ease-enter) both;
+}
+
+dialog[open] {
+  animation: dialog-enter 180ms var(--ease-enter) both;
+}
+
+dialog[open]::backdrop {
+  animation: backdrop-enter var(--motion-base) ease-out both;
+}
+
+.product-loading p,
+[role="status"] {
+  animation: status-enter var(--motion-base) var(--ease-enter) both;
+}
+
+@keyframes panel-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes menu-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes menu-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+  70% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1.02);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes disclosure-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes dialog-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes backdrop-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes status-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes status-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.88);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+    --motion-slow: 0ms;
+  }
+  :is(
+      .primary-action,
+      .secondary-action,
+      .runtime-action,
+      .subtle-action,
+      .icon-button
+    ):active:not(:disabled) {
+    scale: 1;
+  }
+  .list-item,
+  .switch,
+  .switch::after {
+    transition: none;
+  }
+  dialog[open],
+  dialog[open]::backdrop {
+    animation: none;
+  }
+  .conversation-status.running,
+  [role="status"] {
+    animation: none;
+  }
+}

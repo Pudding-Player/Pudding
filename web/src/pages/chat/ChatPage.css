@@ -1,0 +1,424 @@
+.chat-workspace {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.chat-workspace > .chat-scene-switch {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-scroll {
+  overflow-anchor: none;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 34px var(--page-padding) 48px;
+}
+
+.conversation-scene {
+  max-width: var(--chat-prose-width);
+  margin: 0 auto;
+}
+
+.conversation-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.chat-welcome {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  margin: auto;
+  text-align: center;
+}
+
+.chat-welcome h2 {
+  font-size: 29px;
+  letter-spacing: -1px;
+  font-weight: 500;
+  margin: 0;
+}
+
+.chat-welcome .subtle-action {
+  margin-top: 4px;
+}
+
+.chat-welcome .subtle-action .button-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.welcome-mascot {
+  width: clamp(220px, 34vh, 310px);
+  height: clamp(220px, 34vh, 310px);
+  object-fit: contain;
+  display: block;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+}
+
+.chat-workspace.is-welcome .chat-scroll {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 20px 24px 24px;
+  overflow-y: auto;
+  /* 两侧都预留滚动条槽，避免只留右边把欢迎区中心挤偏 3-4px。 */
+  scrollbar-gutter: stable both-edges;
+}
+
+.chat-workspace.is-welcome {
+  justify-content: stretch;
+}
+
+.chat-workspace.is-welcome .composer-dock {
+  margin: 0 auto;
+}
+
+.run-approval,
+.run-error {
+  width: min(100%, 680px);
+  padding: 4px 0 4px 16px;
+  border: 0;
+  border-left: 2px solid var(--chat-detail-rule);
+  border-radius: 0;
+  background: transparent;
+  font-size: 15px;
+}
+
+.run-plan-cluster {
+  width: min(100%, 680px);
+  display: grid;
+  justify-items: start;
+  gap: 5px;
+}
+
+.run-plan {
+  width: 100%;
+  padding-left: 16px;
+  border-left: 2px solid var(--chat-detail-rule);
+}
+
+.run-plan-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--secondary);
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.run-plan-summary:hover {
+  color: var(--text);
+}
+
+.run-plan-summary .sd-chevron {
+  width: 15px;
+  height: 15px;
+}
+
+.run-plan-motion {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-4px);
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    grid-template-rows 220ms var(--ease-enter),
+    opacity 140ms var(--ease-standard),
+    transform 220ms var(--ease-enter),
+    visibility 0s linear 220ms;
+}
+
+.run-plan-cluster[data-expanded="true"] .run-plan-motion {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: none;
+  visibility: visible;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+
+.run-plan-motion-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.run-plan ol {
+  margin: 2px 0 5px;
+  padding-left: 20px;
+  line-height: 1.9;
+  font-size: 15px;
+}
+
+.save-workflow-action {
+  align-self: start;
+  margin-left: 10px;
+}
+
+:root[data-reduced-motion="true"] .run-plan-motion {
+  transition: none;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .run-plan-motion {
+    transition: none;
+    transform: none;
+  }
+}
+
+.run-approval h3,
+.run-error h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.run-approval p,
+.run-error p {
+  margin: 0;
+  line-height: 1.65;
+}
+
+.run-approval details {
+  margin-top: 10px;
+  color: var(--secondary);
+}
+
+.run-approval .detail-actions {
+  margin-top: 12px;
+}
+
+.run-error .detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.composer-dock {
+  position: relative;
+  width: 100%;
+  max-width: var(--chat-prose-width);
+  align-self: center;
+  padding: 12px var(--page-padding) 28px;
+  display: grid;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+/* 问答/审批 dock：与 composer 同宽同 padding，正常文档流，
+   在 chat-scroll 之后、composer 之前，不覆盖任何一方。 */
+.pending-request-dock {
+  /* dock 只是布局占位，显式透明，不给圆角外提供任何矩形底色。 */
+  background: transparent;
+  width: 100%;
+  max-width: var(--chat-prose-width);
+  align-self: center;
+  padding: 10px var(--page-padding) 0;
+  flex: 0 0 auto;
+}
+
+.pending-request-dock:empty {
+  display: none;
+}
+
+.pending-request-dock > * {
+  min-width: 0;
+}
+
+/* 等待用户期间的 composer 提示行：说明在等什么，不是 spinner。 */
+.composer-waiting {
+  width: 100%;
+  max-width: var(--chat-prose-width);
+  align-self: center;
+  margin: 0;
+  padding: 10px var(--page-padding) 0;
+  color: var(--secondary);
+  font-size: 14px;
+  flex: 0 0 auto;
+}
+
+/* 网格列默认 min-width:auto，会把 composer 行的 min-content 撑破窄窗口；
+   释放后操作行才能按上面的收缩规则截断，而不是把 dock 横向撑出滚动。 */
+.composer-dock > * {
+  min-width: 0;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.composer-submit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  /* 窄窗口整行允许收缩，定宽子项靠菜单内省略号兜底，避免横向溢出。 */
+  min-width: 0;
+}
+
+.composer-actions > * {
+  min-width: 0;
+}
+
+.send-action {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  padding: 0;
+  background: var(--solid);
+  color: var(--inverse);
+  border: 0;
+}
+
+.send-action:disabled {
+  opacity: 0.22;
+}
+
+@media (max-width: 1000px) {
+  .chat-welcome h2 {
+    font-size: 25px;
+  }
+}
+
+@media (max-width: 700px) {
+  .chat-scroll {
+    padding: 24px;
+  }
+  .composer-dock {
+    padding: 12px 24px 24px;
+  }
+  .pending-request-dock {
+    padding: 10px 24px 0;
+  }
+  .composer-waiting {
+    padding: 10px 24px 0;
+  }
+  .chat-workspace.is-welcome {
+    padding-bottom: 0;
+  }
+}
+
+/* 短窗等待用户时压缩主输入框可视高度（只读等待态），草稿内容不变、内部可滚；
+   正常编辑/执行不受影响。 */
+@media (max-height: 680px) {
+  .composer-dock[data-waiting="true"] textarea {
+    max-height: 72px;
+    overflow-y: auto;
+  }
+}
+
+@media (max-height: 520px) {
+  .chat-welcome {
+    margin: 0 auto;
+  }
+
+  .welcome-mascot {
+    width: clamp(88px, 25vh, 132px);
+    height: clamp(88px, 25vh, 132px);
+  }
+
+  .chat-welcome h2 {
+    font-size: 23px;
+  }
+
+  .composer-dock {
+    padding-bottom: 18px;
+  }
+}
+
+.chat-unread-anchor {
+  position: relative;
+  flex: 0 0 0;
+  width: 100%;
+  z-index: 20;
+}
+
+.chat-unread {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 20;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  box-shadow: var(--shadow);
+}
+
+.composer-menu {
+  width: auto;
+  max-width: 200px;
+  /* 窄窗口允许收缩，菜单内的触发器文字自带省略号，避免 composer 横向溢出。 */
+  flex-shrink: 1;
+  min-width: 0;
+}
+.composer-model {
+  max-width: 168px;
+}
+.composer-menu [data-ui="select-root"] {
+  width: auto;
+  max-width: 100%;
+}
+.composer-menu [data-ui="select-trigger"] {
+  width: auto;
+  max-width: 100%;
+  height: var(--control-height);
+  min-height: var(--control-height);
+  gap: 4px;
+  padding: 0 8px;
+  border-color: transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  box-shadow: none;
+  font-size: var(--font-body);
+  font-weight: 500;
+  color: var(--secondary);
+}
+.composer-menu [data-ui="select-trigger"] > span {
+  min-width: 0;
+}
+/* 对齐文字字面和箭头图形，而不只对齐各自的外框。 */
+.composer-menu [data-ui="select-trigger"]:hover,
+.composer-menu [data-ui="select-trigger"][aria-expanded="true"] {
+  background: var(--hover);
+  color: var(--text);
+  border-color: transparent;
+}
+
+.send-action[data-stopping="true"] {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.send-action .activity-spinner {
+  width: 14px;
+  height: 14px;
+  border-color: color-mix(in srgb, currentColor 28%, transparent);
+  border-top-color: currentColor;
+}

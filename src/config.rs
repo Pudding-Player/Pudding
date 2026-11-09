@@ -1,0 +1,1194 @@
+use std::{
+    collections::HashMap,
+    env,
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelProtocol {
+    OpenaiResponses,
+    OpenaiChat,
+    AnthropicMessages,
+    Gemini,
+    OllamaChat,
+}
+
+/// 与配置里写的是同一串名字。
+impl std::fmt::Display for ModelProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OpenaiResponses => "openai-responses",
+            Self::OpenaiChat => "openai-chat",
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::Gemini => "gemini",
+            Self::OllamaChat => "ollama-chat",
+        })
+    }
+}
+
+/// Anthropic / Gemini 的鉴权头。`auto`：密钥以 `sk-ant-` 开头用 `x-api-key`，
+/// 否则用 `Authorization: Bearer`。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelAuth {
+    #[default]
+    Auto,
+    ApiKey,
+    Bearer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelOptions {
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default = "default_model_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// OpenAI 兼容端点的显式思考选项，保留提供方原始字段；未配置则不改变默认行为。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
+    /// 该模型的上下文窗口（token）。运行时的上下文预算由它推导。
+    #[serde(default = "default_context_window")]
+    pub context_window: u64,
+    /// Anthropic 提示缓存断点。OpenAI / Gemini 由服务端自动缓存，此开关无效。
+    /// 不支持 `cache_control` 的 Claude 中转要关掉，否则请求返回 400。
+    #[serde(default = "default_true")]
+    pub prompt_cache: bool,
+    /// 只兼容旧配置输入，不再参与联网路由或模型选择。
+    #[serde(default, skip_serializing, rename = "webProvider")]
+    pub legacy_web_provider: Option<serde_json::Value>,
+    #[serde(default, skip_serializing, rename = "webModel")]
+    pub legacy_web_model: Option<serde_json::Value>,
+}
+
+/// 未获知模型容量时的起始窗口；模型列表返回容量时由设置界面采用。
+const fn default_context_window() -> u64 {
+    256_000
+}
+impl Default for ModelOptions {
+    fn default() -> Self {
+        Self {
+            temperature: None,
+            max_output_tokens: None,
+            timeout_ms: default_model_timeout(),
+            reasoning_effort: None,
+            thinking: None,
+            context_window: default_context_window(),
+            prompt_cache: true,
+            legacy_web_provider: None,
+            legacy_web_model: None,
+        }
+    }
+}
+
+const fn default_model_timeout() -> u64 {
+    120_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelConfig {
+    pub id: String,
+    pub name: String,
+    pub protocol: ModelProtocol,
+    pub model: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub auth: ModelAuth,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub options: ModelOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentConfig {
+    #[serde(default = "default_max_turns")]
+    pub max_turns: usize,
+    #[serde(default = "default_max_tools")]
+    pub max_tool_calls_per_turn: usize,
+    pub system_prompt: String,
+    #[serde(default)]
+    pub skill_directories: Vec<PathBuf>,
+    #[serde(default = "default_true")]
+    /// 自动装载已参与插件的 alwaysLoad 短入口；子技能由模型按需读取。
+    pub auto_load_skills: bool,
+    #[serde(default = "default_max_skills")]
+    /// 自动装载的短入口数量上限，不限制显式读取。
+    pub max_loaded_skills: usize,
+    #[serde(default)]
+    pub disabled_skills: Vec<String>,
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
+}
+
+const fn default_max_turns() -> usize {
+    16
+}
+/// 一轮里允许的调用数。单次运行的总量由 `runtime.maxTools` 约束。
+const fn default_max_tools() -> usize {
+    16
+}
+const fn default_max_skills() -> usize {
+    4
+}
+const fn default_true() -> bool {
+    true
+}
+
+pub fn user_skill_directory(config_dir: &Path, config: &AppConfig) -> Option<PathBuf> {
+    let user = config_dir.join("skills");
+    config
+        .agent
+        .skill_directories
+        .iter()
+        .find(|path| *path == &user)
+        .cloned()
+}
+
+/// 配置目录旁的 `skills/` 是用户导入的，其余随产品。
+pub fn skill_directory_source(
+    config_dir: &Path,
+    path: &Path,
+) -> crate::extension::skills::SkillSource {
+    if path == config_dir.join("skills") {
+        crate::extension::skills::SkillSource::User
+    } else {
+        crate::extension::skills::SkillSource::Product
+    }
+}
+
+/// 用户插件落点：配置目录旁的 `plugins/`。
+pub fn user_plugin_directory(config_dir: &Path, config: &AppConfig) -> Option<PathBuf> {
+    let user = config_dir.join("plugins");
+    config
+        .plugins
+        .directories
+        .iter()
+        .find(|path| *path == &user)
+        .cloned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BridgeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub base_url: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    #[serde(default = "default_bridge_timeout")]
+    pub timeout_ms: u64,
+    /// 上次连接成功时宿主的安装目录，连接前用它自动启动 BetterGI。
+    #[serde(default)]
+    pub host_install_path: Option<PathBuf>,
+    /// Start BetterGI when opening the app or connecting. Opt-in, including older configs.
+    #[serde(default)]
+    pub auto_start: bool,
+    /// 是否隐藏自动启动的宿主窗口；默认显示窗口。
+    #[serde(default)]
+    pub launch_silently: bool,
+}
+
+const fn default_bridge_timeout() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginsConfig {
+    #[serde(default)]
+    pub directories: Vec<PathBuf>,
+    #[serde(default)]
+    pub enabled: Vec<String>,
+    /// 随产品提供的宿主插件默认开启，写进这里才关掉。
+    #[serde(default)]
+    pub disabled: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageConfig {
+    pub database: PathBuf,
+}
+
+/// 托盘图标只由桌面壳消费。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TrayConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for TrayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppConfig {
+    pub version: u32,
+    pub active_model: String,
+    pub models: Vec<ModelConfig>,
+    pub agent: AgentConfig,
+    pub bridge: BridgeConfig,
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub runtime: crate::runtime::policy::RuntimeConfig,
+    #[serde(default)]
+    pub hooks: Vec<crate::runtime::host::hooks::HttpHookConfig>,
+    #[serde(default)]
+    pub tray: TrayConfig,
+}
+
+impl AppConfig {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut value: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        // 按文件声明的版本判断，而不是按前一步刚改成的版本。
+        let declared = value["version"].as_u64().unwrap_or(1);
+        if declared == 1 {
+            let backup = path.with_extension("v1.backup.json");
+            if !backup.exists() {
+                fs::copy(path, &backup)?;
+            }
+            value["version"] = serde_json::json!(2);
+            if value["runtime"].is_null() {
+                value["runtime"] =
+                    serde_json::to_value(crate::runtime::policy::RuntimeConfig::default())?;
+            }
+            let candidate: Self = serde_json::from_value(value.clone())?;
+            candidate.validate()?;
+            atomic_write(path, &value)?;
+            log::info!("配置已从 1 迁移到 2，迁移前的文件保留为 config.v1.backup.json");
+        }
+        // v2 的旧默认值 askEach 迁移为 standard；版本号无条件推进。
+        if declared == 2 {
+            value["version"] = serde_json::json!(3);
+            if value["runtime"]["permissionMode"] == serde_json::json!("askEach") {
+                value["runtime"]["permissionMode"] = serde_json::json!("standard");
+            }
+            let candidate: Self = serde_json::from_value(value.clone())?;
+            candidate.validate()?;
+            atomic_write(path, &value)?;
+            log::info!("配置已从 2 迁移到 3");
+        }
+        // 去掉旧的产品技能目录，补上插件目录里的产品根；用户自己的两个目录不动。
+        if declared == 3 {
+            value["version"] = serde_json::json!(4);
+            if !value["plugins"].is_object() {
+                value["plugins"] = serde_json::json!({});
+            }
+            if let Some(directories) = value["agent"]["skillDirectories"].as_array_mut() {
+                directories.retain(|entry| !is_parent_directory(entry, "skills"));
+            }
+            if !value["plugins"]["directories"].is_array() {
+                value["plugins"]["directories"] = serde_json::json!([]);
+            }
+            let directories = value["plugins"]["directories"]
+                .as_array_mut()
+                .ok_or_else(|| Error::Config("plugins.directories must be an array".into()))?;
+            // 产品根排在前面，重名时随产品的插件先占住 id。
+            if !directories
+                .iter()
+                .any(|entry| is_parent_directory(entry, "plugins"))
+            {
+                directories.insert(0, serde_json::json!("../plugins"));
+            }
+            let candidate: Self = serde_json::from_value(value.clone())?;
+            candidate.validate()?;
+            atomic_write(path, &value)?;
+            log::info!("配置已从 3 迁移到 4，领域技能改由 plugins/bgi 提供");
+        }
+        // v5：旧模板把人为轮次/工具上限（32 与 128 的组合）当成默认值写进了
+        // 每份配置，长任务会被它掐断。防失控交给时限、停止按钮与急停热键，
+        // 这两个数字重置为 0（不限制）；用户显式改过的其它值不动。
+        if declared == 4 {
+            value["version"] = serde_json::json!(5);
+            if value["runtime"]["maxDecisions"] == serde_json::json!(32)
+                && value["runtime"]["maxTools"] == serde_json::json!(128)
+            {
+                value["runtime"]["maxDecisions"] = serde_json::json!(0);
+                value["runtime"]["maxTools"] = serde_json::json!(0);
+            }
+            let candidate: Self = serde_json::from_value(value.clone())?;
+            candidate.validate()?;
+            atomic_write(path, &value)?;
+            log::info!("配置已从 4 迁移到 5，运行轮次与工具上限默认不限制");
+        }
+        let base = path
+            .canonicalize()?
+            .parent()
+            .ok_or_else(|| Error::Config("configuration path has no parent".into()))?
+            .to_path_buf();
+        let mut expanded = value.clone();
+        expand_env(&mut expanded)?;
+        let mut config: Self = serde_json::from_value(expanded)?;
+        config.validate()?;
+        let original_database = absolute(&base, &config.storage.database);
+        crate::data_directory::migrate(&base, &original_database)?;
+        let mut changed = relocate_data_path(
+            &base,
+            &mut value["storage"]["database"],
+            &mut config.storage.database,
+        );
+        changed |= relocate_data_path(
+            &base,
+            &mut value["runtime"]["catalogDirectory"],
+            &mut config.runtime.catalog_directory,
+        );
+        for (fields, directories) in [
+            (
+                "/agent/skillDirectories",
+                &mut config.agent.skill_directories,
+            ),
+            ("/plugins/directories", &mut config.plugins.directories),
+        ] {
+            for (index, directory) in directories.iter_mut().enumerate() {
+                if let Some(raw) = value
+                    .pointer_mut(fields)
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|values| values.get_mut(index))
+                {
+                    changed |= relocate_data_path(&base, raw, directory);
+                } else {
+                    relocate_data_path(&base, &mut serde_json::Value::Null, directory);
+                }
+            }
+        }
+        if changed {
+            atomic_write(path, &value)?;
+        }
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn write_document(path: impl AsRef<Path>, content: &str) -> Result<()> {
+        let value: serde_json::Value = serde_json::from_str(content)
+            .map_err(|error| Error::Config(format!("JSON 无效：{error}")))?;
+        if !value.is_object() {
+            return Err(Error::Config("配置必须是 JSON 对象".into()));
+        }
+        let candidate: Self = serde_json::from_value(value.clone())
+            .map_err(|error| Error::Config(error.to_string()))?;
+        candidate.validate()?;
+        atomic_write(path.as_ref(), &value)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.runtime.validate()?;
+        if !(1..=5).contains(&self.version) {
+            return Err(Error::Config("version must be 1, 2, 3, 4 or 5".into()));
+        }
+        if self.models.is_empty() {
+            if !self.active_model.is_empty() {
+                return Err(Error::Config(
+                    "activeModel must be empty when no models are configured".into(),
+                ));
+            }
+        } else {
+            let matching = self
+                .models
+                .iter()
+                .filter(|model| model.id == self.active_model)
+                .count();
+            if matching != 1 {
+                return Err(Error::Config(
+                    "activeModel must reference exactly one configured model".into(),
+                ));
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
+        for model in &self.models {
+            if model.options.context_window < 1024
+                || model.options.max_output_tokens.is_some_and(|tokens| {
+                    tokens == 0 || tokens.saturating_add(1024) > model.options.context_window
+                })
+            {
+                return Err(Error::Config(
+                    "模型上下文至少需要 1024 token，最大输出必须为正数且为输入保留至少 1024 token"
+                        .into(),
+                ));
+            }
+            if model.id.trim().is_empty()
+                || model.model.trim().is_empty()
+                || model.base_url.trim().is_empty()
+            {
+                return Err(Error::Config(
+                    "model id, model, and baseUrl must not be empty".into(),
+                ));
+            }
+            if !ids.insert(&model.id) {
+                return Err(Error::Config(format!("duplicate model id: {}", model.id)));
+            }
+        }
+        let configured = self
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut fallbacks = std::collections::HashSet::new();
+        if self.agent.fallback_models.iter().any(|id| {
+            id == &self.active_model || !configured.contains(id.as_str()) || !fallbacks.insert(id)
+        }) {
+            return Err(Error::Config(
+                "fallbackModels must contain unique configured non-active models".into(),
+            ));
+        }
+        if self.agent.max_turns > 128 {
+            return Err(Error::Config(
+                "agent.maxTurns must be between 1 and 128".into(),
+            ));
+        }
+        if self.agent.max_tool_calls_per_turn == 0 || self.agent.max_tool_calls_per_turn > 64 {
+            return Err(Error::Config(
+                "agent.maxToolCallsPerTurn must be between 1 and 64".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn active(&self) -> Result<&ModelConfig> {
+        self.models
+            .iter()
+            .find(|model| model.id == self.active_model)
+            .ok_or_else(|| Error::Config("还没有配置模型。请先在设置里添加。".into()))
+    }
+
+    pub fn set_active(path: impl AsRef<Path>, model_id: &str) -> Result<()> {
+        let path = path.as_ref();
+        let mut value: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        value["activeModel"] = serde_json::Value::String(model_id.to_owned());
+        let candidate: Self = serde_json::from_value(value.clone())?;
+        candidate.validate()?;
+        atomic_write(path, &value)?;
+        Ok(())
+    }
+
+    /// 写入审批级别，下一轮工具调用生效。
+    pub fn set_permission_mode(
+        path: impl AsRef<Path>,
+        mode: crate::runtime::operation::permissions::PermissionMode,
+    ) -> Result<()> {
+        update_raw(path.as_ref(), |value| {
+            if !value["runtime"].is_object() {
+                value["runtime"] =
+                    serde_json::to_value(crate::runtime::policy::RuntimeConfig::default())?;
+            }
+            value["runtime"]["permissionMode"] = serde_json::to_value(mode)?;
+            Ok(())
+        })
+    }
+
+    /// 仅更新记忆开关，保留配置中的其它字段。
+    pub fn set_memory_enabled(path: impl AsRef<Path>, enabled: bool) -> Result<()> {
+        update_raw(path.as_ref(), |value| {
+            if !value["runtime"].is_object() {
+                value["runtime"] =
+                    serde_json::to_value(crate::runtime::policy::RuntimeConfig::default())?;
+            }
+            value["runtime"]["memoryEnabled"] = serde_json::json!(enabled);
+            Ok(())
+        })
+    }
+
+    /// 写入托盘开关，桌面壳据此显隐图标。
+    pub fn set_tray_enabled(path: impl AsRef<Path>, enabled: bool) -> Result<()> {
+        update_raw(path.as_ref(), |value| {
+            if !value["tray"].is_object() {
+                value["tray"] = serde_json::json!({});
+            }
+            value["tray"]["enabled"] = serde_json::Value::Bool(enabled);
+            Ok(())
+        })
+    }
+
+    pub fn set_skill_enabled(path: impl AsRef<Path>, name: &str, enabled: bool) -> Result<()> {
+        update_raw(path.as_ref(), |value| {
+            let disabled = value["agent"]["disabledSkills"]
+                .as_array_mut()
+                .ok_or_else(|| Error::Config("agent.disabledSkills must be an array".into()))?;
+            disabled.retain(|entry| entry.as_str() != Some(name));
+            if !enabled {
+                disabled.push(serde_json::Value::String(name.to_owned()));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn host_plugin_enabled(&self) -> bool {
+        crate::extension::providers::host_plugin_enabled(&self.plugins.disabled)
+    }
+
+    pub fn plugin_enabled(&self, id: &str) -> bool {
+        crate::extension::providers::plugin_enabled(
+            id,
+            &self.plugins.enabled,
+            &self.plugins.disabled,
+        )
+    }
+
+    pub fn set_plugin_enabled(path: impl AsRef<Path>, id: &str, enabled: bool) -> Result<()> {
+        update_raw(path.as_ref(), |value| {
+            if crate::extension::providers::is_default_enabled_plugin(id) {
+                if !value["plugins"].is_object() {
+                    value["plugins"] = serde_json::json!({});
+                }
+                if !value["plugins"]["disabled"].is_array() {
+                    value["plugins"]["disabled"] = serde_json::json!([]);
+                }
+                let disabled = value["plugins"]["disabled"]
+                    .as_array_mut()
+                    .ok_or_else(|| Error::Config("plugins.disabled must be an array".into()))?;
+                disabled.retain(|entry| entry.as_str() != Some(id));
+                if !enabled {
+                    disabled.push(serde_json::Value::String(id.to_owned()));
+                }
+                return Ok(());
+            }
+            let entries = value["plugins"]["enabled"]
+                .as_array_mut()
+                .ok_or_else(|| Error::Config("plugins.enabled must be an array".into()))?;
+            entries.retain(|entry| entry.as_str() != Some(id));
+            if enabled {
+                entries.push(serde_json::Value::String(id.to_owned()));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_bridge(path: &Path, bridge: &BridgeConfig) -> Result<()> {
+        update_raw(path, |value| {
+            let raw_token = value["bridge"]["token"].clone();
+            let mut resolved_token = raw_token.clone();
+            expand_env(&mut resolved_token)?;
+            value["bridge"] = serde_json::to_value(bridge)?;
+            if resolved_token == value["bridge"]["token"] {
+                value["bridge"]["token"] = raw_token;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn save_model(path: impl AsRef<Path>, input: &serde_json::Value) -> Result<()> {
+        update_raw(path.as_ref(), |value| {
+            let id = input["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| Error::Config("model.id is required".into()))?;
+            let models = value["models"]
+                .as_array_mut()
+                .ok_or_else(|| Error::Config("models must be an array".into()))?;
+            let existing = models
+                .iter_mut()
+                .find(|model| model["id"].as_str() == Some(id));
+            let timeout = input
+                .get("timeoutMs")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|value| (1000..=600_000).contains(value))
+                        .ok_or_else(|| Error::Config("响应超时必须在 1 到 600 秒之间".into()))
+                })
+                .transpose()?;
+            let context_window = input
+                .get("contextWindow")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|value| (8_192..=2_000_000).contains(value))
+                        .ok_or_else(|| Error::Config("上下文窗口必须在 8k 到 2M token 之间".into()))
+                })
+                .transpose()?;
+            let max_output = input
+                .get("maxOutputTokens")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|value| (256..=128_000).contains(value))
+                        .ok_or_else(|| {
+                            Error::Config("最大输出必须在 256 到 128k token 之间".into())
+                        })
+                })
+                .transpose()?;
+            let auth = input
+                .get("auth")
+                .cloned()
+                .filter(|value| matches!(value.as_str(), Some("auto" | "apiKey" | "bearer")));
+            let prompt_cache = input
+                .get("promptCache")
+                .and_then(serde_json::Value::as_bool);
+            if let Some(model) = existing {
+                if let Some(options) = model["options"].as_object_mut() {
+                    options.remove("webProvider");
+                    options.remove("webModel");
+                }
+                if let Some(timeout) = timeout {
+                    model["options"]["timeoutMs"] = serde_json::json!(timeout);
+                }
+                if let Some(window) = context_window {
+                    model["options"]["contextWindow"] = serde_json::json!(window);
+                }
+                if let Some(max_output) = max_output {
+                    model["options"]["maxOutputTokens"] = serde_json::json!(max_output);
+                }
+                if let Some(prompt_cache) = prompt_cache {
+                    model["options"]["promptCache"] = serde_json::json!(prompt_cache);
+                }
+                if let Some(auth) = auth {
+                    model["auth"] = auth;
+                }
+                for field in ["name", "protocol", "model", "baseUrl"] {
+                    model[field] = input[field].clone();
+                }
+                if input["apiKey"].as_str().is_some_and(|key| !key.is_empty()) {
+                    model["apiKey"] = input["apiKey"].clone();
+                }
+            } else {
+                let mut options = serde_json::json!({"timeoutMs":timeout.unwrap_or(120_000)});
+                if let Some(window) = context_window {
+                    options["contextWindow"] = serde_json::json!(window);
+                }
+                if let Some(max_output) = max_output {
+                    options["maxOutputTokens"] = serde_json::json!(max_output);
+                }
+                if let Some(prompt_cache) = prompt_cache {
+                    options["promptCache"] = serde_json::json!(prompt_cache);
+                }
+                let mut model = serde_json::json!({
+                    "id": id,
+                    "name": input["name"],
+                    "protocol": input["protocol"],
+                    "model": input["model"],
+                    "baseUrl": input["baseUrl"],
+                    "apiKey": input["apiKey"],
+                    "headers": {},
+                    "options": options
+                });
+                if let Some(auth) = auth {
+                    model["auth"] = auth;
+                }
+                models.push(model);
+            }
+            if value["activeModel"].as_str().unwrap_or("").is_empty() {
+                value["activeModel"] = serde_json::json!(id);
+            }
+            Ok(())
+        })
+    }
+
+    /// 用户技能落点：配置文件旁的 `skills/`，没有就补上。
+    pub fn ensure_user_skill_directory(path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = path.as_ref();
+        let config = AppConfig::load(path)?;
+        let config_dir = path
+            .parent()
+            .ok_or_else(|| Error::Config("configuration path has no parent".into()))?;
+        if let Some(existing) = user_skill_directory(config_dir, &config) {
+            fs::create_dir_all(&existing)?;
+            return Ok(existing);
+        }
+        let root = config_dir.join("skills");
+        fs::create_dir_all(&root)?;
+        update_raw(path, |value| {
+            let dirs = value["agent"]["skillDirectories"]
+                .as_array_mut()
+                .ok_or_else(|| Error::Config("skillDirectories must be an array".into()))?;
+            dirs.push(serde_json::json!("./skills"));
+            Ok(())
+        })?;
+        Ok(root)
+    }
+
+    pub fn delete_model(path: impl AsRef<Path>, id: &str) -> Result<String> {
+        let mut active = String::new();
+        update_raw(path.as_ref(), |value| {
+            let current_active = value["activeModel"].as_str().unwrap_or("").to_owned();
+            let next_active = {
+                let models = value["models"]
+                    .as_array_mut()
+                    .ok_or_else(|| Error::Config("models must be an array".into()))?;
+                let before = models.len();
+                models.retain(|model| model["id"].as_str() != Some(id));
+                if models.len() == before {
+                    return Err(Error::Config("模型配置不存在".into()));
+                }
+                if current_active == id {
+                    models
+                        .first()
+                        .and_then(|model| model["id"].as_str())
+                        .unwrap_or("")
+                        .to_owned()
+                } else {
+                    current_active
+                }
+            };
+            value["activeModel"] = serde_json::Value::String(next_active.clone());
+            if let Some(fallbacks) = value["agent"]["fallbackModels"].as_array_mut() {
+                fallbacks.retain(|entry| {
+                    let current = entry.as_str();
+                    current != Some(id) && current != Some(next_active.as_str())
+                });
+            }
+            active = next_active;
+            Ok(())
+        })?;
+        Ok(active)
+    }
+}
+
+pub const USAGE: &str = "\
+Pudding — 面向 BetterGI 的本地桌面 Agent
+
+用法:
+  pudding [配置文件]
+  pudding --mcp-bgi --config <已有配置文件>  提供 BGI 标准 MCP stdio 服务
+
+配置解析顺序:
+  1. 命令行第一个参数（相对路径相对于可执行文件所在目录）
+  2. 环境变量 PUDDING_CONFIG（旧名 SLEEPY_DOLL_CONFIG 继续可用）
+  3. <可执行文件目录>/user/config.json
+  4. 安装目录不可写时退回 %APPDATA%\\Pudding\\user\\config.json（旧版 Sleepy Doll 目录作为最后回退）
+
+选项:
+  -h, --help       显示本帮助
+  -V, --version    显示版本";
+
+/// 从进程参数解析配置路径的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    /// 要加载或生成模板的配置文件。
+    Config(PathBuf),
+    /// 请求了 `--help`，调用方打印 [`USAGE`]。
+    Help,
+    /// 请求了 `--version`，调用方打印 [`VERSION`]。
+    Version,
+}
+
+pub const VERSION: &str = concat!("Pudding ", env!("CARGO_PKG_VERSION"));
+
+/// 解析配置文件路径。显式参数或 `PUDDING_CONFIG` 优先，否则用安装目录下的
+/// `user/`。相对路径以可执行文件所在目录为基准，不用工作目录。
+pub fn resolve_path() -> Result<Resolved> {
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let explicit = env::args_os().nth(1);
+    let environment = env::var_os("PUDDING_CONFIG").or_else(|| env::var_os("SLEEPY_DOLL_CONFIG"));
+    resolve_from(
+        explicit.as_deref(),
+        environment.as_deref(),
+        exe_dir.as_deref(),
+        user_data_root(),
+        &writable_directory,
+    )
+}
+
+/// 漫游目录下留给本产品的那一层。安装目录不可写时用户数据落在这里。
+const ROAMING_DIRECTORY: &str = "Pudding";
+/// 更名前的漫游目录。老安装曾把用户数据放在这里，作为最后的回退位置保留读取。
+const LEGACY_ROAMING_DIRECTORY: &str = "Sleepy Doll";
+
+/// 安装目录不可写时用户数据落到的目录（`%APPDATA%\Pudding`）。卸载要按同一条
+/// 规则找回来。
+pub fn fallback_directory() -> Option<PathBuf> {
+    user_data_root().map(|root| root.join(ROAMING_DIRECTORY))
+}
+
+/// 安装目录不可写时用的用户数据根。
+fn user_data_root() -> Option<PathBuf> {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+}
+
+/// 纯解析：不读环境变量，不写文件系统。`is_writable` 由调用方注入。
+fn resolve_from(
+    explicit: Option<&OsStr>,
+    env_config: Option<&OsStr>,
+    exe_dir: Option<&Path>,
+    data_root: Option<PathBuf>,
+    is_writable: &dyn Fn(&Path) -> bool,
+) -> Result<Resolved> {
+    if let Some(raw) = explicit {
+        let text = raw.to_string_lossy();
+        match text.as_ref() {
+            "-h" | "--help" => return Ok(Resolved::Help),
+            "-V" | "--version" => return Ok(Resolved::Version),
+            _ if text.starts_with('-') => {
+                return Err(Error::Config(format!("未知选项: {text}\n\n{USAGE}")));
+            }
+            _ => {}
+        }
+        return Ok(Resolved::Config(explicit_config(raw, exe_dir)?));
+    }
+    if let Some(raw) = env_config {
+        return Ok(Resolved::Config(explicit_config(raw, exe_dir)?));
+    }
+    if let Some(directory) = exe_dir.map(|dir| dir.join("user"))
+        && is_writable(&directory)
+    {
+        return Ok(Resolved::Config(directory.join("config.json")));
+    }
+    // 安装位置不可写时退回用户数据根；旧版目录里已有数据时优先沿用旧位置。
+    for name in [ROAMING_DIRECTORY, LEGACY_ROAMING_DIRECTORY] {
+        if let Some(directory) = data_root
+            .as_ref()
+            .map(|root| root.join(name).join("user"))
+            .filter(|directory| {
+                name == ROAMING_DIRECTORY || directory.join("config.json").is_file()
+            })
+            && is_writable(&directory)
+        {
+            return Ok(Resolved::Config(directory.join("config.json")));
+        }
+    }
+    Err(Error::Config(
+        "找不到可写的配置目录。请把 Pudding 安装到可写位置，或设置 PUDDING_CONFIG 指向一个可写的 .json 文件。".into(),
+    ))
+}
+
+fn explicit_config(raw: &OsStr, exe_dir: Option<&Path>) -> Result<PathBuf> {
+    let path = PathBuf::from(raw);
+    let is_json = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    if !is_json && !path.exists() {
+        return Err(Error::Config(format!(
+            "配置文件必须是 .json 文件: {}",
+            path.display()
+        )));
+    }
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let base = exe_dir
+        .ok_or_else(|| Error::Config("无法解析相对配置路径：拿不到可执行文件所在目录。".into()))?;
+    Ok(base.join(path))
+}
+
+/// 判断 `directory` 能否存放用户数据，不创建任何东西。目录不存在时可以接受，
+/// 只要它最近的已存在祖先可写 —— 目录随后由 `seed` 创建。
+fn writable_directory(directory: &Path) -> bool {
+    let mut ancestor = directory;
+    while !ancestor.exists() {
+        match ancestor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => ancestor = parent,
+            _ => return false,
+        }
+    }
+    let probe = ancestor.join(format!(".pudding-write-probe-{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 首次运行时把随产品分发的模板写进用户目录；旁边存在旧版 Sleepy Doll 安装时，
+/// 先从旧目录一次性复制用户数据（配置、数据库与收藏内容），源目录保持不动。
+pub fn seed(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| Error::Config("configuration path has no parent".into()))?;
+    fs::create_dir_all(directory)?;
+    import_legacy_install(directory)?;
+    // 模板把技能、插件与目录根建在自己旁边。
+    for child in ["skills", "plugins", "catalog", crate::data_directory::NAME] {
+        if child == crate::data_directory::NAME
+            && directory.join(crate::data_directory::LEGACY_NAME).exists()
+        {
+            continue;
+        }
+        fs::create_dir_all(directory.join(child))?;
+    }
+    if !path.exists() {
+        fs::write(path, TEMPLATE)?;
+    }
+    Ok(())
+}
+
+/// 更名前的默认安装目录名（`D:\Sleepy Doll`、`%LOCALAPPDATA%\Programs\Sleepy Doll`）。
+const LEGACY_INSTALL_DIRECTORY: &str = "Sleepy Doll";
+
+/// 从同一父目录下的旧版安装导入用户数据。仅在全新用户目录上执行一次：
+/// 复制 `config.json` 与 `data/`、`skills/`、`plugins/`、`catalog/`，不移动、
+/// 不删除、不覆盖源目录里的任何文件。旧版仍在运行时直接报错，不复制写了一半的数据库。
+fn import_legacy_install(directory: &Path) -> Result<()> {
+    if directory.join(crate::data_directory::NAME).exists() {
+        return Ok(());
+    }
+    let Some(parent) = directory.parent() else {
+        return Ok(());
+    };
+    let legacy = parent.join(LEGACY_INSTALL_DIRECTORY).join("user");
+    if !legacy.join("config.json").is_file() {
+        return Ok(());
+    }
+    let data = legacy.join(crate::data_directory::NAME);
+    let mut guards: Vec<fs::File> = Vec::new();
+    for lock in ["sleepy-doll.runtime.lock", "pudding.runtime.lock"] {
+        let path = data.join(lock);
+        if path.is_file() {
+            let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+            file.try_lock().map_err(|_| {
+                Error::Conflict(
+                    "检测到旧版 Sleepy Doll 正在运行；请先退出旧版，再重新启动 Pudding 完成数据导入。"
+                        .into(),
+                )
+            })?;
+            guards.push(file);
+        }
+    }
+    log::info!("从旧版安装目录导入用户数据：{}", legacy.display());
+    fs::copy(legacy.join("config.json"), directory.join("config.json"))?;
+    for child in [crate::data_directory::NAME, "skills", "plugins", "catalog"] {
+        let source = legacy.join(child);
+        if source.is_dir() {
+            copy_tree(&source, &directory.join(child))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+const TEMPLATE: &str = include_str!("../pudding.config.example.json");
+
+pub fn migrate_developer_configuration(previous: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() || !previous.exists() {
+        return Ok(());
+    }
+    let source = previous
+        .parent()
+        .ok_or_else(|| Error::Config("旧开发配置没有目录".into()))?;
+    let target = destination
+        .parent()
+        .ok_or_else(|| Error::Config("开发配置没有目录".into()))?;
+    if target.exists() {
+        return Err(Error::Config(
+            "新开发数据目录已存在但没有配置，未覆盖旧开发数据".into(),
+        ));
+    }
+    let config = AppConfig::load(previous)?;
+    let lock_path = config.storage.database.with_extension("runtime.lock");
+    let _guard = if lock_path.parent().is_some_and(Path::is_dir) {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        file.try_lock()
+            .map_err(|_| Error::Conflict("旧开发后台正在运行，请关闭后重新启动".into()))?;
+        Some(file)
+    } else {
+        None
+    };
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(previous)?)?;
+    for field in ["/storage/database", "/runtime/catalogDirectory"] {
+        if let Some(value) = raw.pointer_mut(field) {
+            rebase_moved_path(value, source, target)?;
+        }
+    }
+    for field in ["/agent/skillDirectories", "/plugins/directories"] {
+        if let Some(values) = raw
+            .pointer_mut(field)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for value in values {
+                rebase_moved_path(value, source, target)?;
+            }
+        }
+    }
+    atomic_write(previous, &raw)?;
+    fs::create_dir_all(
+        target
+            .parent()
+            .ok_or_else(|| Error::Config("开发目录没有父目录".into()))?,
+    )?;
+    drop(_guard);
+    fs::rename(source, target)?;
+    if let Some(legacy_root) = source.parent()
+        && legacy_root
+            .file_name()
+            .is_some_and(|name| name == crate::data_directory::LEGACY_NAME)
+        && fs::read_dir(legacy_root)?.next().is_none()
+    {
+        fs::remove_dir(legacy_root)?;
+    }
+    Ok(())
+}
+
+fn relocate_data_path(base: &Path, raw: &mut serde_json::Value, actual: &mut PathBuf) -> bool {
+    let absolute = absolute(base, actual);
+    let relocated = crate::data_directory::relocated_path(base, &absolute);
+    let changed = relocated != absolute && raw.as_str().is_some_and(|raw| !raw.contains("${ENV:"));
+    if changed {
+        let stored = if actual.is_absolute() {
+            relocated.clone()
+        } else {
+            crate::data_directory::relative_path(base, &relocated)
+                .unwrap_or_else(|| relocated.clone())
+        };
+        *raw = serde_json::json!(stored);
+    }
+    *actual = relocated;
+    changed
+}
+
+fn rebase_moved_path(value: &mut serde_json::Value, source: &Path, target: &Path) -> Result<()> {
+    let mut expanded = value.clone();
+    expand_env(&mut expanded)?;
+    let Some(raw) = expanded.as_str() else {
+        return Ok(());
+    };
+    let original = Path::new(raw);
+    let mut resolved = PathBuf::new();
+    for component in source.join(original).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            _ => resolved.push(component.as_os_str()),
+        }
+    }
+    let resolved = resolved.canonicalize().unwrap_or(resolved);
+    if let Some(relative) = crate::data_directory::relative_path(&source.canonicalize()?, &resolved)
+    {
+        if original.is_absolute() {
+            *value = serde_json::json!(target.join(relative));
+        }
+    } else if !original.is_absolute() {
+        *value = serde_json::json!(resolved);
+    }
+    Ok(())
+}
+
+fn update_raw(
+    path: &Path,
+    change: impl FnOnce(&mut serde_json::Value) -> Result<()>,
+) -> Result<()> {
+    let mut value: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    if value["agent"]["disabledSkills"].is_null() {
+        value["agent"]["disabledSkills"] = serde_json::json!([]);
+    }
+    change(&mut value)?;
+    let candidate: AppConfig = serde_json::from_value(value.clone())?;
+    candidate.validate()?;
+    atomic_write(path, &value)?;
+    Ok(())
+}
+
+pub(crate) fn atomic_write(path: &Path, value: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+    // 后缀是追加而不是替换，文件名仍以 `.json.<id>.tmp` 结尾，忽略规则按这个匹配。
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary = path.with_file_name(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(format!("{}\n", serde_json::to_string_pretty(value)?).as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(e) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// 配置里的这条相对目录是否就是 `../<name>`。按字面比较，不碰文件系统。
+fn is_parent_directory(entry: &serde_json::Value, name: &str) -> bool {
+    entry
+        .as_str()
+        .map(|text| text.trim().replace('\\', "/"))
+        .is_some_and(|text| text.trim_end_matches('/') == format!("../{name}"))
+}
+
+fn absolute(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+/// 展开 `${ENV:NAME}` 形式的字符串值；测试 CLI 复用同一语义解析模型配置。
+pub fn expand_env(value: &mut serde_json::Value) -> Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(name) = text
+                .strip_prefix("${ENV:")
+                .and_then(|rest| rest.strip_suffix('}'))
+            {
+                *text = env::var(name).unwrap_or_default();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                expand_env(item)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                expand_env(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}

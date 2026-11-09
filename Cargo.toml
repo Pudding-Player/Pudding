@@ -1,0 +1,151 @@
+[package]
+name = "pudding"
+version = "0.2.0"
+edition = "2024"
+description = "General desktop agent for game scripting tools, with a BetterGI plugin"
+license = "MIT"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:tao", "dep:wry", "dep:rust-embed", "dep:mime_guess"]
+dev-ipc = ["dep:tiny_http"]
+# 安装器使用原生 Slint 界面，可在没有 WebView2 的电脑上运行。
+setup = ["dep:flate2", "dep:slint", "dep:slint-build", "dep:raw-window-handle", "dep:png"]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.16"
+ureq = { version = "3.4.1", features = ["json"] }
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+# SDK 的 HTTP 客户端沿用现有 Rustls ring provider，避免再引入一套加密后端。
+rmcp = { version = "3.5.1", default-features = false, features = ["client", "server", "transport-io", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
+sha2 = "0.10"
+semver = "1"
+regex = "1"
+html2text = { version = "0.17", default-features = false }
+url = "2.5"
+base64 = "0.22"
+futures-util = "0.3"
+log = { version = "0.4", features = ["std"] }
+jsonschema = { version = "0.33", default-features = false }
+time = { version = "0.3.44", features = ["formatting", "parsing"] }
+tiny_http = { version = "0.12.0", optional = true }
+tao = { version = "0.37.0", optional = true }
+wry = { version = "0.56.1", optional = true }
+rust-embed = { version = "8.12.0", optional = true }
+mime_guess = { version = "2.0.5", optional = true }
+# 安装程序读嵌入的载荷；默认后端是纯 Rust 的 miniz_oxide。
+flate2 = { version = "1.1", optional = true }
+slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "software-renderer-path", "compat-1-18", "raw-window-handle-06", "accessibility", "unstable-winit-030"], optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+png = { version = "0.17", optional = true }
+
+[build-dependencies]
+embed-resource = "3.0"
+serde_json = "1.0"
+slint-build = { version = "=1.18.1", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_System_TaskScheduler", "Win32_System_Variant", "Win32_System_Ole"] }
+tray-icon = { version = "0.21", features = ["common-controls-v6"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Time",
+  "Win32_System_StationsAndDesktops",
+  "Win32_Security_WinTrust",
+  "Win32_Security_Cryptography",
+  "Win32_Security_Cryptography_Catalog",
+  "Win32_Security_Cryptography_Sip",
+  "Win32_System_JobObjects",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Com",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Graphics_Dwm",
+  "Win32_UI_HiDpi",
+  "Win32_Graphics_Gdi",
+] }
+
+[profile.dev]
+# Keep backtrace symbols without full type/variable debug info. Tests inherit this profile.
+debug = 1
+# Repeated feature combinations otherwise retain large incremental object caches.
+incremental = false
+
+[profile.release]
+# 交付体积优先：panic = "abort" 去掉展开清理路径，opt-level = "s" 以少量速度换体积。
+lto = "fat"
+strip = true
+codegen-units = 1
+panic = "abort"
+opt-level = "s"
+
+[[bin]]
+name = "pudding"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "pudding-agent-host"
+path = "src/bin/pudding-agent-host.rs"
+
+[[bin]]
+name = "pudding-dev"
+path = "src/bin/pudding-dev.rs"
+required-features = ["dev-ipc"]
+
+[[bin]]
+name = "bgi-agent-check"
+path = "src/bin/bgi-agent-check.rs"
+required-features = ["dev-ipc"]
+
+# 测试工具：技能规划隔离验收，不进发布包。
+[[bin]]
+name = "bgi-skill-plan-check"
+path = "src/bin/bgi-skill-plan-check.rs"
+required-features = ["dev-ipc"]
+
+# 只在显式 --features setup 时编译：它 include_bytes! 构建期生成的载荷，
+# 普通构建下那个文件不存在。
+[[bin]]
+name = "pudding-setup"
+path = "src/bin/pudding-setup.rs"
+required-features = ["setup"]
+
+[[test]]
+name = "desktop-startup"
+path = "tests/desktop/desktop-startup.rs"
+required-features = ["desktop"]
+
+[[test]]
+name = "window-chrome"
+path = "tests/desktop/window-chrome.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "pudding-setup-preview"
+path = "src/bin/pudding-setup-preview.rs"
+required-features = ["setup", "dev-ipc"]
+
+[[test]]
+name = "tray-request"
+path = "tests/desktop/tray-request.rs"
+
+[[test]]
+name = "tray-popup-click"
+path = "tests/desktop/tray-popup-click.rs"
+required-features = ["desktop"]

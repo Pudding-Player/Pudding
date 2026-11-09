@@ -1,0 +1,985 @@
+//! 五种模型协议的请求体构造与响应解析。
+
+use std::collections::BTreeMap;
+
+use serde_json::{Value, json};
+
+use super::{Message, ModelResponse, Reasoning, Role, ToolCall, Usage};
+use crate::{
+    config::{ModelConfig, ModelProtocol},
+    error::{Error, Result},
+    extension::ToolDefinition,
+};
+pub(super) fn openai_message(message: &Message) -> Value {
+    match message.role {
+        Role::Tool => {
+            json!({"role":"tool","tool_call_id":message.tool_call_id,"content":message.content})
+        }
+        Role::Assistant if !message.tool_calls.is_empty() => json!({
+            "role":"assistant", "content": if message.content.is_empty() { Value::Null } else { json!(message.content) },
+            "tool_calls": message.tool_calls.iter().map(|call| json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments.to_string()}})).collect::<Vec<_>>()
+        }),
+        _ => json!({"role":wire_role(message.role),"content":message.content}),
+    }
+}
+
+fn wire_role(role: Role) -> Role {
+    if role == Role::Context {
+        Role::User
+    } else {
+        role
+    }
+}
+
+fn tool_schema(tool: &ToolDefinition) -> Value {
+    json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})
+}
+
+pub(super) fn openai_chat_body(
+    config: &ModelConfig,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Value {
+    let converted = messages
+        .iter()
+        .map(|message| {
+            let mut converted = openai_message(message);
+            // GLM 的思考工具轮需要原样回传；普通 OpenAI Chat 不接受此扩展字段。
+            if openai_model_stem(&config.model)
+                .to_ascii_lowercase()
+                .starts_with("glm-")
+                && message.role == Role::Assistant
+                && let Some(reasoning) = message
+                    .reasoning
+                    .as_ref()
+                    .filter(|r| r.matches(ModelProtocol::OpenaiChat))
+            {
+                let original = reasoning
+                    .blocks
+                    .iter()
+                    .find_map(|block| block["reasoning_content"].as_str())
+                    .or_else(|| {
+                        reasoning
+                            .blocks
+                            .is_empty()
+                            .then_some(reasoning.text.as_str())
+                            .filter(|text| !text.is_empty())
+                    });
+                if let Some(original) = original {
+                    converted["reasoning_content"] = json!(original);
+                }
+            }
+            converted
+        })
+        .collect::<Vec<_>>();
+    let mut body = json!({"model":config.model,"messages":converted,"tools":tools.iter().map(tool_schema).collect::<Vec<_>>()});
+    let stem = openai_model_stem(&config.model);
+    if let Some(value) = config.options.temperature
+        && !is_openai_o_series(stem)
+    {
+        body["temperature"] = json!(value);
+    }
+    if let Some(value) = config.options.max_output_tokens {
+        let field = if uses_max_completion_tokens(stem) {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[field] = json!(value);
+    }
+    if let Some(value) = &config.options.reasoning_effort {
+        body["reasoning_effort"] = json!(value);
+    }
+    if let Some(value) = &config.options.thinking {
+        body["thinking"] = value.clone();
+    }
+    body
+}
+
+pub(super) fn apply_reasoning_options(config: &ModelConfig, body: &mut Value) -> Result<()> {
+    if let Some(thinking) = &config.options.thinking
+        && (config.protocol != ModelProtocol::OpenaiChat || !thinking.is_object())
+    {
+        return Err(Error::Config(
+            "thinking选项需要OpenAI兼容Chat协议和对象参数".into(),
+        ));
+    }
+    let Some(effort) = &config.options.reasoning_effort else {
+        return Ok(());
+    };
+    match config.protocol {
+        ModelProtocol::OpenaiChat | ModelProtocol::OpenaiResponses => Ok(()),
+        ModelProtocol::AnthropicMessages => {
+            let model = openai_model_stem(&config.model).to_ascii_lowercase();
+            let adaptive = [
+                "claude-sonnet-4-6",
+                "claude-opus-4-6",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+            ]
+            .iter()
+            .any(|stem| model == *stem || model.starts_with(&format!("{stem}-")));
+            if !adaptive {
+                return Err(Error::Config("此模型的 Anthropic 接口尚未支持推理强度设置；请清空 reasoningEffort，或使用支持该设置的 OpenAI Chat / Responses 接口".into()));
+            }
+            body["thinking"] = json!({"type":"adaptive"});
+            body["output_config"] = json!({"effort":effort});
+            Ok(())
+        }
+        _ => Err(Error::Config(format!(
+            "{} 接口尚未支持推理强度设置，请清空 reasoningEffort",
+            config.protocol
+        ))),
+    }
+}
+
+pub(super) fn responses_body(
+    config: &ModelConfig,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Value {
+    let mut input = Vec::new();
+    for message in messages {
+        match message.role {
+            Role::Tool => input.push(json!({"type":"function_call_output","call_id":message.tool_call_id,"output":message.content})),
+            Role::Assistant => {
+                // 推理项必须排在同一个 function_call 之前。
+                if let Some(reasoning) = message
+                    .reasoning
+                    .as_ref()
+                    .filter(|r| r.matches(ModelProtocol::OpenaiResponses))
+                {
+                    input.extend(reasoning.blocks.iter().filter_map(replay_reasoning_item));
+                }
+                if message.tool_calls.is_empty() {
+                    input.push(json!({"role":message.role,"content":message.content}));
+                } else {
+                    if !message.content.is_empty() { input.push(json!({"role":"assistant","content":message.content})); }
+                    input.extend(message.tool_calls.iter().map(|call| json!({"type":"function_call","call_id":call.id,"name":call.name,"arguments":call.arguments.to_string()})));
+                }
+            }
+            _ => input.push(json!({"role":wire_role(message.role),"content":message.content})),
+        }
+    }
+    let response_tools = tools.iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema})).collect::<Vec<_>>();
+    let mut body = json!({"model":config.model,"input":input,"tools":response_tools});
+    if let Some(value) = config.options.temperature {
+        body["temperature"] = json!(value);
+    }
+    if let Some(value) = config.options.max_output_tokens {
+        body["max_output_tokens"] = json!(value);
+    }
+    if let Some(value) = &config.options.reasoning_effort {
+        body["reasoning"] = json!({"effort":value});
+    }
+    body
+}
+
+pub(super) fn anthropic_body(
+    config: &ModelConfig,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Value {
+    let system = messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut converted: Vec<Value> = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role != Role::System)
+    {
+        let (role, blocks) = if message.role == Role::Tool {
+            let is_error = serde_json::from_str::<Value>(&message.content)
+                .ok()
+                .is_some_and(|value| value["ok"] == false);
+            (
+                "user",
+                vec![json!({
+                    "type":"tool_result",
+                    "tool_use_id":message.tool_call_id,
+                    "content":message.content,
+                    "is_error":is_error
+                })],
+            )
+        } else {
+            // Anthropic 要求思考块位于同一轮的 text / tool_use 之前，顺序与模型
+            // 生成时一致。思考块只能挂在 assistant 轮，协议标签不符的载荷丢弃。
+            let mut content = match &message.reasoning {
+                Some(reasoning)
+                    if message.role == Role::Assistant
+                        && reasoning.matches(ModelProtocol::AnthropicMessages) =>
+                {
+                    reasoning.blocks.clone()
+                }
+                _ => vec![],
+            };
+            if !message.content.is_empty() {
+                content.push(json!({"type":"text","text":message.content}));
+            }
+            content.extend(message.tool_calls.iter().map(
+                |call| json!({"type":"tool_use","id":call.id,"name":call.name,"input":call.arguments}),
+            ));
+            (
+                if message.role == Role::Assistant {
+                    "assistant"
+                } else {
+                    "user"
+                },
+                content,
+            )
+        };
+        if blocks.is_empty() {
+            continue;
+        }
+        // Anthropic 要求角色交替：并行的工具结果必须并进紧跟在 assistant
+        // tool_use 之后的一条 user 消息。
+        if converted
+            .last()
+            .is_some_and(|last| last["role"].as_str() == Some(role))
+        {
+            let content = converted
+                .last_mut()
+                .and_then(|last| last["content"].as_array_mut())
+                .expect("Anthropic 消息的 content 恒为数组");
+            if role == "user" && blocks.iter().all(|block| block["type"] == "tool_result") {
+                let insert_at = content
+                    .iter()
+                    .position(|block| block["type"] != "tool_result")
+                    .unwrap_or(content.len());
+                content.splice(insert_at..insert_at, blocks);
+            } else {
+                content.extend(blocks);
+            }
+        } else {
+            converted.push(json!({"role":role,"content":blocks}));
+        }
+    }
+    let mut body = json!({"model":config.model,"system":system,"max_tokens":config.options.max_output_tokens.unwrap_or(8192),"messages":converted,"tools":tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"input_schema":tool.input_schema})).collect::<Vec<_>>()});
+    if config.options.prompt_cache {
+        inject_anthropic_cache(&mut body);
+    }
+    body
+}
+
+pub(super) fn gemini_body(
+    config: &ModelConfig,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Value {
+    let system = messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut contents: Vec<Value> = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role != Role::System)
+    {
+        let role = if message.role == Role::Assistant {
+            "model"
+        } else {
+            "user"
+        };
+        let parts = if message.role == Role::Tool {
+            let name = messages
+                .iter()
+                .flat_map(|m| m.tool_calls.iter())
+                .find(|c| Some(&c.id) == message.tool_call_id.as_ref())
+                .map(|c| c.name.as_str())
+                .unwrap_or("unknown_tool");
+            vec![json!({"functionResponse":{"name":name,"response":{"output":message.content}}})]
+        } else {
+            let mut parts = if message.content.is_empty() {
+                vec![]
+            } else {
+                vec![json!({"text":message.content})]
+            };
+            // Gemini 3 起强制校验 thoughtSignature：收到就必须附回同一个 part，
+            // 不能合并也不能与 part 分离，否则 400。
+            let signatures = message
+                .reasoning
+                .as_ref()
+                .filter(|r| r.matches(ModelProtocol::Gemini))
+                .map(|r| {
+                    r.blocks
+                        .iter()
+                        .filter_map(|b| {
+                            let signature = b["signature"]
+                                .as_str()
+                                .or_else(|| b["thoughtSignature"].as_str())
+                                .or_else(|| b["thought_signature"].as_str())?;
+                            Some((b["callIndex"].as_u64()? as usize, signature.to_owned()))
+                        })
+                        .collect::<BTreeMap<usize, String>>()
+                })
+                .unwrap_or_default();
+            parts.extend(message.tool_calls.iter().enumerate().map(|(index, call)| {
+                let mut part =
+                    json!({"functionCall":{"name":call.name,"args":call.arguments,"id":call.id}});
+                if let Some(signature) = signatures.get(&index) {
+                    part["thoughtSignature"] = json!(signature);
+                }
+                part
+            }));
+            parts
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        // Gemini 按前一条 functionCall 计数 functionResponse：并行的工具结果
+        // 必须落在同一条 user content 里。
+        if contents
+            .last()
+            .is_some_and(|last| last["role"].as_str() == Some(role))
+        {
+            contents
+                .last_mut()
+                .and_then(|last| last["parts"].as_array_mut())
+                .expect("Gemini content 的 parts 恒为数组")
+                .extend(parts);
+        } else {
+            contents.push(json!({"role":role,"parts":parts}));
+        }
+    }
+    // 工具定义是 JSON Schema；parameters 是 Gemini 的 Schema 消息，不能承载
+    // additionalProperties 等 JSON Schema 关键字。
+    json!({"systemInstruction":{"parts":[{"text":system}]},"contents":contents,"tools":[{"functionDeclarations":tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"parametersJsonSchema":tool.input_schema})).collect::<Vec<_>>()}],"generationConfig":{"temperature":config.options.temperature,"maxOutputTokens":config.options.max_output_tokens}})
+}
+
+pub(super) fn ollama_body(
+    config: &ModelConfig,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Value {
+    json!({"model":config.model,"stream":false,"messages":messages.iter().map(openai_message).collect::<Vec<_>>(),"tools":tools.iter().map(tool_schema).collect::<Vec<_>>(),"options":{"temperature":config.options.temperature,"num_predict":config.options.max_output_tokens}})
+}
+
+fn openai_model_stem(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// o1 / o3 / o4：官方 Chat Completions 拒绝 `max_tokens` 和 `temperature`。
+fn is_openai_o_series(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.len() > 1
+        && model.starts_with('o')
+        && model.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
+}
+
+fn uses_max_completion_tokens(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    is_openai_o_series(&model) || model.starts_with("gpt-5")
+}
+
+/// Anthropic 提示缓存：最多 4 个断点，标在 tools 末、system 末、最新非 thinking
+/// 块，长对话再标上一条更早的 user。`cache_control` 不能进 openai-chat：
+/// Kimi / NIM / Qwen 会因它直接 400。
+fn inject_anthropic_cache(body: &mut Value) {
+    let existing = count_cache_breakpoints(body);
+    let mut budget = 4usize.saturating_sub(existing);
+    if budget == 0 {
+        return;
+    }
+    if let Some(last) = body
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .and_then(|tools| tools.last_mut())
+        && set_ephemeral_cache(last)
+    {
+        budget -= 1;
+    }
+    if budget > 0 {
+        if let Some(text) = body
+            .get("system")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            && !text.is_empty()
+        {
+            body["system"] = json!([{"type": "text", "text": text}]);
+        }
+        if let Some(last) = body
+            .get_mut("system")
+            .and_then(Value::as_array_mut)
+            .and_then(|system| system.last_mut())
+            && set_ephemeral_cache(last)
+        {
+            budget -= 1;
+        }
+    }
+    if budget == 0 {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages.iter_mut().rev() {
+        if inject_message_breakpoint(message) {
+            budget -= 1;
+            break;
+        }
+    }
+    if budget == 0 || messages.len() < 4 {
+        return;
+    }
+    let mut user_count = 0;
+    for message in messages.iter_mut().rev() {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        user_count += 1;
+        if user_count == 2 {
+            inject_message_breakpoint(message);
+            break;
+        }
+    }
+}
+
+fn set_ephemeral_cache(value: &mut Value) -> bool {
+    if value.get("cache_control").is_some() {
+        return false;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    object.insert("cache_control".into(), json!({"type": "ephemeral"}));
+    true
+}
+
+fn inject_message_breakpoint(message: &mut Value) -> bool {
+    let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let Some(block) = content.iter_mut().rev().find(|block| {
+        !matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+    }) else {
+        return false;
+    };
+    set_ephemeral_cache(block)
+}
+
+fn count_cache_breakpoints(body: &Value) -> usize {
+    let mut count = 0;
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        count += tools
+            .iter()
+            .filter(|t| t.get("cache_control").is_some())
+            .count();
+    }
+    if let Some(system) = body.get("system").and_then(Value::as_array) {
+        count += system
+            .iter()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+    }
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(content) = message.get("content").and_then(Value::as_array) {
+                count += content
+                    .iter()
+                    .filter(|b| b.get("cache_control").is_some())
+                    .count();
+            }
+        }
+    }
+    count
+}
+
+pub(crate) fn usage_from_openai_chat(node: &Value) -> Usage {
+    Usage {
+        input_tokens: node["prompt_tokens"].as_u64(),
+        output_tokens: node["completion_tokens"].as_u64(),
+        cache_read_tokens: node["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .or_else(|| node["prompt_tokens_details"]["cachedTokens"].as_u64()),
+        cache_write_tokens: None,
+    }
+}
+
+pub(crate) fn usage_from_openai_responses(node: &Value) -> Usage {
+    Usage {
+        input_tokens: node["input_tokens"].as_u64(),
+        output_tokens: node["output_tokens"].as_u64(),
+        cache_read_tokens: node["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .or_else(|| node["cache_read_input_tokens"].as_u64()),
+        cache_write_tokens: node["cache_creation_input_tokens"].as_u64(),
+    }
+}
+
+pub(crate) fn usage_from_anthropic(node: &Value) -> Usage {
+    Usage {
+        input_tokens: node["input_tokens"].as_u64(),
+        output_tokens: node["output_tokens"].as_u64(),
+        cache_read_tokens: node["cache_read_input_tokens"].as_u64(),
+        cache_write_tokens: node["cache_creation_input_tokens"].as_u64(),
+    }
+}
+
+pub(crate) fn usage_from_gemini(node: &Value) -> Usage {
+    Usage {
+        input_tokens: node["promptTokenCount"].as_u64(),
+        output_tokens: node["candidatesTokenCount"].as_u64(),
+        cache_read_tokens: node["cachedContentTokenCount"].as_u64(),
+        cache_write_tokens: None,
+    }
+}
+
+pub(crate) fn usage_from_ollama(raw: &Value) -> Usage {
+    Usage {
+        input_tokens: raw["prompt_eval_count"].as_u64(),
+        output_tokens: raw["eval_count"].as_u64(),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+    }
+}
+
+fn parse_arguments(value: &Value) -> Result<Value> {
+    if value.is_object() {
+        return Ok(value.clone());
+    }
+    if let Some(text) = value.as_str() {
+        return serde_json::from_str(text)
+            .map_err(|_| Error::ModelProtocol("模型返回的工具参数不合法".into()));
+    }
+    Ok(json!({}))
+}
+
+/// 整理一个 reasoning 输出项以便回传。
+///
+/// 原样保留 `id` 与 `encrypted_content`，只去掉值为 `null` 的键：显式送
+/// `"encrypted_content": null` 会被严格的服务端拒绝，正确做法是省略该字段。
+fn replay_reasoning_item(item: &Value) -> Option<Value> {
+    let mut item = item.as_object()?.clone();
+    item.retain(|_, value| !value.is_null());
+    Some(Value::Object(item))
+}
+
+/// 收集 Gemini 的 thought 文本与 `functionCall` 的 `thoughtSignature`。
+///
+/// 签名按 `functionCall` 在轮内的序号索引：运行时会重写 call id，part 顺序稳定。
+/// 并行调用时只有第一个 `functionCall` 带签名。
+fn gemini_reasoning(parts: &[Value]) -> Option<Reasoning> {
+    let mut text = String::new();
+    let mut signatures = Vec::new();
+    let mut call_index = 0usize;
+    for part in parts {
+        if part["thought"] == true {
+            text.push_str(&string(&part["text"]));
+        }
+        if part.get("functionCall").is_some() {
+            if let Some(signature) = part["thoughtSignature"].as_str() {
+                signatures.push(json!({"callIndex": call_index, "signature": signature}));
+            }
+            call_index += 1;
+        }
+    }
+    if signatures.is_empty() && text.is_empty() {
+        return None;
+    }
+    Some(Reasoning {
+        protocol: ModelProtocol::Gemini,
+        blocks: signatures,
+        text,
+    })
+}
+
+/// Ollama 的思考文本只用于展示。
+fn display_reasoning(protocol: ModelProtocol, text: Option<&str>) -> Option<Reasoning> {
+    let text = text.unwrap_or_default();
+    (!text.is_empty()).then(|| Reasoning {
+        protocol,
+        blocks: vec![],
+        text: text.to_owned(),
+    })
+}
+
+fn chat_reasoning(message: &Value) -> Option<Reasoning> {
+    let mut original = serde_json::Map::new();
+    for field in ["reasoning_content", "reasoning"] {
+        if let Some(text) = message[field].as_str() {
+            original.insert(field.into(), json!(text));
+        }
+    }
+    let text = original
+        .get("reasoning_content")
+        .or_else(|| original.get("reasoning"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    (!original.is_empty()).then_some(Reasoning {
+        protocol: ModelProtocol::OpenaiChat,
+        blocks: vec![Value::Object(original)],
+        text,
+    })
+}
+
+/// 收集 Responses 的 reasoning 输出项。
+///
+/// 整项克隆：`encrypted_content` 必须逐字回传，在 `store=false` 下它是推理上下文
+/// 唯一的载体。
+fn responses_reasoning(output: &[Value]) -> Option<Reasoning> {
+    let kept = output
+        .iter()
+        .filter(|item| item["type"] == "reasoning")
+        .cloned()
+        .collect::<Vec<_>>();
+    if kept.is_empty() {
+        return None;
+    }
+    let text = kept
+        .iter()
+        .flat_map(|item| item["summary"].as_array().into_iter().flatten())
+        .map(|part| string(&part["text"]))
+        .collect::<String>();
+    Some(Reasoning {
+        protocol: ModelProtocol::OpenaiResponses,
+        blocks: kept,
+        text,
+    })
+}
+
+/// 收集 Anthropic 的思考块。
+///
+/// 整块克隆，不提取文本：`signature` 与 `redacted_thinking` 的 `data` 都必须逐字
+/// 回传，少一个键、改一个字符，下一轮就是 400。
+fn anthropic_reasoning(blocks: &[Value]) -> Option<Reasoning> {
+    let kept = blocks
+        .iter()
+        .filter(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if kept.is_empty() {
+        return None;
+    }
+    let text = kept
+        .iter()
+        .filter(|item| item["type"] == "thinking")
+        .map(|item| string(&item["thinking"]))
+        .collect::<String>();
+    Some(Reasoning {
+        protocol: ModelProtocol::AnthropicMessages,
+        blocks: kept,
+        text,
+    })
+}
+
+pub(crate) fn parse_response(protocol: ModelProtocol, raw: &Value) -> Result<ModelResponse> {
+    match protocol {
+        ModelProtocol::OpenaiChat => {
+            let choice = raw["choices"]
+                .as_array()
+                .and_then(|items| items.first())
+                .ok_or_else(|| Error::ModelProtocol("OpenAI 响应里没有 choices".into()))?;
+            let message = &choice["message"];
+            let calls = message["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|call| {
+                    Ok(ToolCall {
+                        id: string(&call["id"]),
+                        name: string(&call["function"]["name"]),
+                        arguments: parse_arguments(&call["function"]["arguments"])?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ModelResponse {
+                text: string(&message["content"]),
+                tool_calls: calls,
+                finish_reason: choice["finish_reason"].as_str().map(str::to_owned),
+                usage: usage_from_openai_chat(&raw["usage"]),
+                reasoning: chat_reasoning(message),
+            })
+        }
+        ModelProtocol::OpenaiResponses => {
+            let output = raw["output"].as_array().cloned().unwrap_or_default();
+            let text = output
+                .iter()
+                .filter(|item| item["type"] == "message")
+                .flat_map(|item| item["content"].as_array().into_iter().flatten())
+                .filter(|item| item["type"] == "output_text")
+                .map(|item| string(&item["text"]))
+                .collect::<String>();
+            let calls = output
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .map(|call| {
+                    Ok(ToolCall {
+                        id: string(&call["call_id"]),
+                        name: string(&call["name"]),
+                        arguments: parse_arguments(&call["arguments"])?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ModelResponse {
+                text,
+                tool_calls: calls,
+                finish_reason: if raw["status"] == "incomplete" {
+                    Some(
+                        raw["incomplete_details"]["reason"]
+                            .as_str()
+                            .unwrap_or("max_output_tokens")
+                            .to_owned(),
+                    )
+                } else {
+                    raw["status"].as_str().map(str::to_owned)
+                },
+                usage: usage_from_openai_responses(&raw["usage"]),
+                reasoning: responses_reasoning(&output),
+            })
+        }
+        ModelProtocol::AnthropicMessages => {
+            let blocks = raw["content"].as_array().cloned().unwrap_or_default();
+            let text = blocks
+                .iter()
+                .filter(|item| item["type"] == "text")
+                .map(|item| string(&item["text"]))
+                .collect::<String>();
+            let calls = blocks
+                .iter()
+                .filter(|item| item["type"] == "tool_use")
+                .map(|call| ToolCall {
+                    id: string(&call["id"]),
+                    name: string(&call["name"]),
+                    arguments: call["input"].clone(),
+                })
+                .collect();
+            Ok(ModelResponse {
+                text,
+                tool_calls: calls,
+                finish_reason: raw["stop_reason"].as_str().map(str::to_owned),
+                usage: usage_from_anthropic(&raw["usage"]),
+                reasoning: anthropic_reasoning(&blocks),
+            })
+        }
+        ModelProtocol::Gemini => {
+            let candidate = raw["candidates"]
+                .as_array()
+                .and_then(|items| items.first())
+                .ok_or_else(|| Error::ModelProtocol("Gemini 响应里没有 candidates".into()))?;
+            let parts = candidate["content"]["parts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let text = parts
+                .iter()
+                .filter(|item| item["thought"] != true)
+                .map(|item| string(&item["text"]))
+                .collect::<String>();
+            let calls = parts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    item.get("functionCall").map(|call| ToolCall {
+                        id: call["id"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("gemini-call-{index}")),
+                        name: string(&call["name"]),
+                        arguments: call["args"].clone(),
+                    })
+                })
+                .collect();
+            Ok(ModelResponse {
+                text,
+                tool_calls: calls,
+                finish_reason: candidate["finishReason"].as_str().map(str::to_owned),
+                usage: usage_from_gemini(&raw["usageMetadata"]),
+                reasoning: gemini_reasoning(&parts),
+            })
+        }
+        ModelProtocol::OllamaChat => {
+            let message = &raw["message"];
+            let calls = message["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, call)| ToolCall {
+                    id: format!("ollama-call-{index}"),
+                    name: string(&call["function"]["name"]),
+                    arguments: call["function"]["arguments"].clone(),
+                })
+                .collect();
+            Ok(ModelResponse {
+                text: string(&message["content"]),
+                tool_calls: calls,
+                finish_reason: raw["done_reason"].as_str().map(str::to_owned),
+                usage: usage_from_ollama(raw),
+                reasoning: display_reasoning(
+                    ModelProtocol::OllamaChat,
+                    message["thinking"].as_str(),
+                ),
+            })
+        }
+    }
+}
+
+fn string(value: &Value) -> String {
+    value.as_str().unwrap_or_default().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ProtocolModel;
+
+    fn config(model: &str, protocol: ModelProtocol) -> ModelConfig {
+        serde_json::from_value(json!({"id":"fixture","name":"fixture","model":model,
+            "protocol":protocol,"baseUrl":"https://example.invalid/v1"}))
+        .unwrap()
+    }
+
+    #[test]
+    fn gemini_tool_json_schema_preserves_nested_constraints() {
+        let tool: ToolDefinition = serde_json::from_value(json!({
+            "name": "fixture.lookup",
+            "description": "Look up entries",
+            "source": "fixture",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                        "additionalProperties": false
+                    },
+                    "labels": {"type": "object", "additionalProperties": {"type": "string"}}
+                },
+                "required": ["filter"],
+                "additionalProperties": false
+            }
+        }))
+        .unwrap();
+        let body = ProtocolModel::new(config("gemini", ModelProtocol::Gemini))
+            .body(&[], std::slice::from_ref(&tool))
+            .unwrap();
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert!(declaration.get("parameters").is_none());
+        assert_eq!(declaration["parametersJsonSchema"], tool.input_schema);
+        // 其他协议仍沿用各自的参数字段。
+        let openai = ProtocolModel::new(config("fixture", ModelProtocol::OpenaiChat))
+            .body(&[], std::slice::from_ref(&tool))
+            .unwrap();
+        assert_eq!(
+            openai["tools"][0]["function"]["parameters"],
+            tool.input_schema
+        );
+    }
+
+    #[test]
+    fn glm_tool_round_preserves_original_reasoning_after_storage() {
+        let original = "\n先核对状态。  \n";
+        let response = parse_response(
+            ModelProtocol::OpenaiChat,
+            &json!({"choices":[{
+            "message":{"content":null,"reasoning_content":original,"reasoning":"display alias",
+                "tool_calls":[{"id":"call-1","function":{"name":"read","arguments":"{}"}}]},
+            "finish_reason":"tool_calls"}]}),
+        )
+        .unwrap();
+        let message = Message {
+            role: Role::Assistant,
+            content: response.text,
+            tool_call_id: None,
+            tool_calls: response.tool_calls,
+            reasoning: response.reasoning,
+        };
+        let stored: Message =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let result = Message {
+            role: Role::Tool,
+            content: "result".into(),
+            tool_call_id: Some("call-1".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        };
+        let messages = [stored.clone(), result];
+        let glm = ProtocolModel::new(config("z-ai/GLM-5.3-Flash", ModelProtocol::OpenaiChat))
+            .body(&messages, &[])
+            .unwrap();
+        assert_eq!(glm["messages"][0]["reasoning_content"], original);
+        assert!(glm["messages"][0].get("reasoning").is_none());
+        assert_eq!(glm["messages"][1]["tool_call_id"], "call-1");
+        let normal = ProtocolModel::new(config("gpt-5", ModelProtocol::OpenaiChat))
+            .body(&messages, &[])
+            .unwrap();
+        assert!(normal["messages"][0].get("reasoning_content").is_none());
+        let mut wrong_protocol = stored;
+        wrong_protocol.reasoning.as_mut().unwrap().protocol = ModelProtocol::AnthropicMessages;
+        let glm = ProtocolModel::new(config("glm-5.3-flash", ModelProtocol::OpenaiChat))
+            .body(&[wrong_protocol], &[])
+            .unwrap();
+        assert!(glm["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn explicit_thinking_options_are_preserved_without_changing_effort_or_defaults() {
+        let mut model = config("same-model", ModelProtocol::OpenaiChat);
+        let initial = ProtocolModel::new(model.clone()).body(&[], &[]).unwrap();
+        assert!(initial.get("thinking").is_none());
+        let thinking = json!({"type":"enabled","clear_thinking":false});
+        model.options.thinking = Some(thinking.clone());
+        for effort in ["low", "max"] {
+            model.options.reasoning_effort = Some(effort.into());
+            let body = ProtocolModel::new(model.clone()).body(&[], &[]).unwrap();
+            assert_eq!(body["thinking"], thinking);
+            assert_eq!(body["reasoning_effort"], effort);
+            assert_eq!(body["model"], "same-model");
+        }
+        model.protocol = ModelProtocol::OpenaiResponses;
+        assert!(matches!(
+            ProtocolModel::new(model).body(&[], &[]),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn reasoning_effort_is_translated_or_explicitly_rejected() {
+        for (protocol, model) in [
+            (ModelProtocol::OpenaiChat, "glm-5.3-flash"),
+            (ModelProtocol::OpenaiResponses, "gpt-5"),
+            (ModelProtocol::AnthropicMessages, "claude-sonnet-4-6"),
+        ] {
+            let mut config = config(model, protocol);
+            config.options.reasoning_effort = Some("low".into());
+            let body = ProtocolModel::new(config).body(&[], &[]).unwrap();
+            match protocol {
+                ModelProtocol::OpenaiChat => assert_eq!(body["reasoning_effort"], "low"),
+                ModelProtocol::OpenaiResponses => assert_eq!(body["reasoning"]["effort"], "low"),
+                _ => {
+                    assert_eq!(body["thinking"]["type"], "adaptive");
+                    assert_eq!(body["output_config"]["effort"], "low");
+                }
+            }
+        }
+        for (protocol, model) in [
+            (ModelProtocol::AnthropicMessages, "glm-5.3-flash"),
+            (ModelProtocol::AnthropicMessages, "claude-sonnet-4-5"),
+            (ModelProtocol::Gemini, "gemini"),
+            (ModelProtocol::OllamaChat, "local"),
+        ] {
+            let mut config = config(model, protocol);
+            assert!(ProtocolModel::new(config.clone()).body(&[], &[]).is_ok());
+            config.options.reasoning_effort = Some("low".into());
+            assert!(matches!(
+                ProtocolModel::new(config).body(&[], &[]),
+                Err(Error::Config(_))
+            ));
+        }
+    }
+}

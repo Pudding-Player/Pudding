@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Pudding.Preview.Base" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+    <style name="Theme.Pudding.Preview" parent="Theme.Pudding.Preview.Base" />
+</resources>

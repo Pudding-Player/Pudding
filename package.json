@@ -1,0 +1,66 @@
+{
+  "name": "pudding-ui",
+  "version": "0.2.0",
+  "description": "Desktop agent for game scripting tools, with a BetterGI plugin",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "frame": "node scripts/frame.mjs dev",
+    "frame:setup": "node scripts/frame.mjs setup",
+    "frame:typecheck": "node scripts/frame.mjs typecheck",
+    "frame:build": "node scripts/frame.mjs build",
+    "frame:serve": "node scripts/frame.mjs serve",
+    "test:frame": "node tests/ui/frame-ui-check.mjs",
+    "android:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Action build",
+    "android:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Action publish",
+    "android:preview": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Action preview",
+    "android:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Action check",
+    "backend": "cargo run --no-default-features --features dev-ipc --bin pudding-dev",
+    "desktop": "npm run dist && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Action Desktop",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node scripts/release-version.mjs && npm run typecheck && vite build",
+    "dist": "cmd /c scripts\\build.cmd",
+    "clean:rust": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/clean-rust.ps1",
+    "test": "node --test cloudflare/worker.test.mjs scripts/r2-budget.test.mjs scripts/release-version.test.mjs scripts/build-boundary.test.mjs scripts/replace-release.test.mjs",
+    "format": "prettier --write \"web/**/*.{ts,tsx,css,html}\" \"packages/ui/**/*.{ts,tsx,css,json}\" \"frame/**/*.{ts,tsx,css}\" \"*.{json,ts}\" \"!package-lock.json\"",
+    "format:check": "prettier --check \"web/**/*.{ts,tsx,css,html}\" \"packages/ui/**/*.{ts,tsx,css,json}\" \"frame/**/*.{ts,tsx,css}\" \"*.{json,ts}\" \"!package-lock.json\"",
+    "video:dev": "vite --config video/vite.config.ts",
+    "video:keyframes": "node video/render-keyframes.mjs",
+    "video:build": "tsc -p video/tsconfig.json --noEmit && vite build --config video/vite.config.ts",
+    "video:film": "node video/make-video.mjs",
+    "video:preview": "node video/make-video.mjs --preview",
+    "video:check": "node video/make-video.mjs --check",
+    "check:repo": "node scripts/check-repository.mjs"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "@pudding/ui": "*",
+    "@vitejs/plugin-react": "^6.1.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "vite": "^8.3.1"
+  },
+  "devDependencies": {
+    "@remotion/bundler": "4.0.539",
+    "@remotion/cli": "4.0.539",
+    "@remotion/renderer": "4.0.539",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.186.0",
+    "playwright": "^1.63.0",
+    "prettier": "^3.6.0",
+    "remotion": "4.0.539",
+    "three": "^0.186.1",
+    "typescript": "^5.8.0"
+  },
+  "license": "MIT"
+}

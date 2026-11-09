@@ -1,0 +1,399 @@
+/* 待处理请求层：独立 dock 内的 normal-flow 内容，宽随 dock（与 composer 同宽），
+   不覆盖消息流与输入框；交互区高度封顶，短窗口在层内部滚动。 */
+.pending-request-layer {
+  /* 外层只是滚动容器，不提供任何背板：显式透明，
+     圆角外不留矩形背景/裁切痕迹，卡片自带背景与边框。 */
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  /* 等待时宿主按真实可用空间写入变量；无变量（非等待/未挂载）用兜底。 */
+  max-height: var(--pending-request-max-height, 70dvh);
+  overflow-y: auto;
+}
+
+.pending-request-layer > * {
+  flex-shrink: 0;
+}
+
+.pending-question {
+  display: grid;
+  min-width: 0;
+}
+
+.pending-question-motion,
+.pending-question > .pending-request-chip {
+  grid-area: 1 / 1;
+}
+
+.pending-question-motion {
+  display: grid;
+  grid-template-rows: 0fr;
+  min-width: 0;
+  min-height: 0;
+  opacity: 0;
+  transition:
+    grid-template-rows 220ms var(--ease-standard),
+    opacity 140ms var(--ease-standard);
+}
+
+.pending-question[data-expanded="true"] > .pending-question-motion {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.pending-question-inner {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.pending-question > .pending-request-chip {
+  align-self: start;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 100ms var(--ease-standard),
+    visibility 0s 100ms;
+}
+
+.pending-question[data-expanded="false"] > .pending-request-chip {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 70ms, 0s;
+}
+
+@starting-style {
+  .pending-question[data-expanded="true"] > .pending-question-motion {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+}
+
+.pending-request-card {
+  /* 单卡自身 flex column：header/footer 不缩，body 内部滚动，
+     长题短窗也不会把 footer 主按钮截掉。 */
+  display: flex;
+  flex-direction: column;
+  max-height: var(--pending-request-max-height, 70dvh);
+  padding: 14px 16px;
+  border: var(--border-width, 1px) solid var(--border);
+  border-radius: var(--layout-radius);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.pending-request-card:focus-within {
+  border-color: var(--border-strong);
+}
+
+.pending-request-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+
+.pending-question .pending-request-header {
+  position: relative;
+  min-height: 32px;
+  padding-right: 40px;
+}
+
+.pending-request-header > svg {
+  width: 16px;
+  height: 16px;
+  color: var(--gold);
+  flex-shrink: 0;
+}
+
+.pending-request-header h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-request-progress {
+  flex-shrink: 0;
+  color: var(--secondary);
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.pending-request-badge {
+  margin-left: auto;
+  border-radius: 6px;
+  padding: 2px 8px;
+  color: var(--gold);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.pending-request-collapse {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--secondary);
+  line-height: 1;
+}
+
+.pending-request-collapse-icon {
+  width: 18px;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+}
+
+.pending-request-collapse:hover {
+  background: var(--subtle);
+}
+
+.pending-request-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.pending-request-footer {
+  flex-shrink: 0;
+}
+
+.pending-request-text {
+  margin: 0 0 10px;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+/* MarkdownText 渲染块级 p/ol/ul，容器是 div，收敛它们的默认外边距。 */
+.pending-request-text > :first-child {
+  margin-top: 0;
+}
+
+.pending-request-text > :last-child {
+  margin-bottom: 0;
+}
+
+.pending-request-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pending-request-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 8px;
+  align-items: start;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.pending-request-option:hover {
+  border-color: var(--border-strong);
+}
+
+.pending-request-option[data-checked="true"] {
+  border-color: color-mix(in srgb, var(--gold) 65%, var(--border));
+  background: color-mix(in srgb, var(--gold) 8%, transparent);
+}
+
+.pending-request-option input {
+  width: 16px;
+  height: 16px;
+  /* product.css 的 :where(input:not([type=checkbox])) 控件规则会给 radio
+     抬高 32px 行高并加边框/padding，这里必须一并复位。 */
+  min-height: 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  align-self: start;
+  /* 首行 line-height 20px 的行盒中心在 10px；radio 中心 8px，下移 2px 对齐。 */
+  margin-top: 2px;
+  accent-color: var(--gold);
+}
+
+.pending-request-option-label {
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.pending-request-freeform {
+  width: 100%;
+  min-height: 64px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--subtle);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  resize: vertical;
+}
+
+.pending-request-freeform:focus {
+  border-color: var(--border-strong);
+  outline: none;
+}
+
+.pending-request-error {
+  margin: 8px 0 0;
+  color: var(--danger, #c0392b);
+  font-size: 14px;
+}
+
+.pending-request-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.pending-request-footer .muted {
+  margin: 0;
+  font-size: 14px;
+}
+
+.pending-request-submit {
+  margin-left: auto;
+}
+
+.pending-approval-card details {
+  margin-top: 4px;
+}
+
+/* 审批卡 footer：两按钮紧邻右对齐，不用两端拉开；只作用审批卡，问答卡不动。 */
+.pending-approval-card .pending-request-footer {
+  justify-content: flex-end;
+}
+
+.pending-approval-card .pending-request-submit {
+  margin-left: 0;
+  flex: none;
+}
+
+.pending-approval-card pre {
+  max-height: 160px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--subtle);
+  font-size: 14px;
+}
+
+/* 收起/已答复状态的入口：与展开卡片同宽的左对齐紧凑条，不右漂、无浮层阴影。 */
+.pending-request-chip {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  align-self: stretch;
+  width: 100%;
+  padding: 8px 12px;
+  border: var(--border-width, 1px) solid var(--border);
+  border-radius: var(--layout-radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  text-align: left;
+}
+
+.pending-request-chip > svg {
+  width: 14px;
+  height: 14px;
+  color: var(--gold);
+}
+
+/* 审批摘要的业务变更列表：label/value 两列清晰可读。 */
+.pending-approval-changes {
+  margin: 0 0 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pending-approval-change {
+  display: grid;
+  /* 两列都 minmax(0,…)：超长字段名/值在窄屏换行而不是把列撑爆。 */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  column-gap: 10px;
+  align-items: baseline;
+}
+
+.pending-approval-change dt {
+  color: var(--secondary);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.pending-approval-change dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .pending-request-card {
+    padding: 12px;
+  }
+  .pending-request-header {
+    flex-wrap: wrap;
+  }
+  .pending-request-footer {
+    flex-wrap: wrap;
+  }
+  .pending-request-submit {
+    flex: 1;
+  }
+}
+
+@media (max-width: 420px) {
+  .pending-question .pending-request-badge {
+    display: none;
+  }
+}
+
+@media (max-height: 680px) {
+  .pending-request-freeform {
+    min-height: 48px;
+  }
+}
+
+/* 单个问题只保留正文的一个滚动容器，避免外层也出现细小滚动条。 */
+.pending-request-layer:has(> .pending-request-card:only-child),
+.pending-request-layer:has(> .pending-question:only-child) {
+  overflow-y: clip;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pending-question-motion,
+  .pending-question > .pending-request-chip {
+    transition: none;
+  }
+}

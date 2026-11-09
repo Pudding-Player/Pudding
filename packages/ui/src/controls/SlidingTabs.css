@@ -1,0 +1,67 @@
+.sd-tabs {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--subtle);
+}
+
+.sd-tabs-pill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 0;
+  border-radius: 6px;
+  background: var(--selected);
+  pointer-events: none;
+  transform-origin: 0 0;
+  opacity: 0;
+  /* left/top/width/height 由组件按当前选中按钮的本地 offset 精确设置（含高度与顶部）。 */
+}
+
+.sd-tabs-pill[data-ready="true"] {
+  opacity: 1;
+}
+
+.sd-tabs-icon {
+  display: contents;
+}
+
+.sd-tabs button {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--control-height);
+  padding: 0 13px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font-size: var(--font-body);
+  font-weight: 550;
+  color: var(--secondary);
+  white-space: nowrap;
+  transition: color var(--motion-fast) var(--ease-standard);
+}
+
+.sd-tabs button:hover {
+  color: var(--text);
+}
+
+.sd-tabs button.is-active {
+  color: var(--text);
+}
+
+.sd-tabs button:active:not(:disabled) {
+  transform: none;
+  scale: 1;
+}
+
+.sd-tabs-count {
+  color: var(--muted);
+  font-size: var(--font-meta);
+}

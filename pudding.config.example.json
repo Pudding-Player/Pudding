@@ -1,0 +1,45 @@
+{
+  "version": 5,
+  "activeModel": "",
+  "models": [],
+  "agent": {
+    "maxTurns": 16,
+    "maxToolCallsPerTurn": 16,
+    "systemPrompt": "",
+    "skillDirectories": ["./skills"],
+    "autoLoadSkills": true,
+    "maxLoadedSkills": 4,
+    "disabledSkills": [],
+    "fallbackModels": []
+  },
+  "bridge": {
+    "enabled": true,
+    "baseUrl": "http://127.0.0.1:26101",
+    "token": "${ENV:BGI_BRIDGE_TOKEN}",
+    "instanceId": "",
+    "timeoutMs": 30000,
+    "hostInstallPath": null,
+    "launchSilently": false
+  },
+  "plugins": {
+    "directories": ["../plugins", "./plugins"],
+    "enabled": [],
+    "disabled": []
+  },
+  "storage": {
+    "database": "./data/pudding.db"
+  },
+  "runtime": {
+    "catalogDirectory": "./catalog",
+    "maxDecisions": 0,
+    "maxTools": 0,
+    "maxReplans": 2,
+    "durationSec": 1800,
+    "permissionMode": "askEach",
+    "grants": [],
+    "trustGrants": []
+  },
+  "tray": {
+    "enabled": true
+  }
+}

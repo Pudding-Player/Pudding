@@ -1,0 +1,2786 @@
+use super::*;
+#[path = "memory-review.rs"]
+mod memory_review_tests;
+#[path = "web-extraction.rs"]
+mod web_extraction_tests;
+#[path = "web-live.rs"]
+mod web_live_tests;
+#[path = "web-tools.rs"]
+mod web_tools_tests;
+use crate::config::ModelConfig;
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::atomic::{AtomicBool, Ordering},
+    thread::JoinHandle,
+};
+
+struct ModelFixture {
+    url: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    stopped: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ModelFixture {
+    fn is_memory_review(request: &Value) -> bool {
+        request["tools"][0]["function"]["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("runtime_memory_experiences_"))
+    }
+
+    // 非学习场景仍接收并归档总结评估；不让它消耗主任务的脚本响应。
+    fn with_empty_memory_review(
+        mut reply: impl FnMut(&Value) -> (u16, Value) + Send + 'static,
+    ) -> Self {
+        Self::new(move |request| {
+            if Self::is_memory_review(request) {
+                (
+                    200,
+                    answer(&json!({"goalRelevant":true,"experiences":[]}).to_string()),
+                )
+            } else {
+                reply(request)
+            }
+        })
+    }
+
+    fn task_requests(&self) -> Vec<Value> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| !Self::is_memory_review(request))
+            .cloned()
+            .collect()
+    }
+
+    fn new(mut reply: impl FnMut(&Value) -> (u16, Value) + Send + 'static) -> Self {
+        Self::with_headers(move |request| {
+            let (status, mut body) = reply(request);
+            // 既有场景用参数对象描述辅助决策；模拟端按请求工具封装真实调用协议。
+            // 原始协议反例用 with_headers，避免此便捷适配掩盖文字响应错误。
+            if let Some(name) = request["tools"][0]["function"]["name"]
+                .as_str()
+                .filter(|name| {
+                    name.starts_with("fixture_decision_")
+                        || name.starts_with("runtime_memory_experiences_")
+                })
+                && body["choices"][0]["message"]["tool_calls"].is_null()
+                && let Some(text) = body["choices"][0]["message"]["content"].as_str()
+                && let Ok(arguments) = serde_json::from_str::<Value>(text)
+            {
+                body["choices"][0]["message"]["content"] = json!("");
+                body["choices"][0]["message"]["tool_calls"] = json!([{"id":"decision","type":"function","function":{"name":name,"arguments":arguments.to_string()}}]);
+                if body["choices"][0]["finish_reason"] == "stop" {
+                    body["choices"][0]["finish_reason"] = json!("tool_calls");
+                }
+            }
+            (status, body, String::new())
+        })
+    }
+
+    fn with_headers(
+        mut reply: impl FnMut(&Value) -> (u16, Value, String) + Send + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let recorded = requests.clone();
+        let stop = stopped.clone();
+        let thread = std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let request = read_request(&mut stream);
+                recorded.lock().unwrap().push(request.clone());
+                let (status, body, extra_headers) = reply(&request);
+                let body = body.to_string();
+                let header = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        Self {
+            url,
+            requests,
+            stopped,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[tokio::test]
+async fn long_retry_after_does_not_replay_http_request() {
+    let fixture = ModelFixture::with_headers(|_| {
+        (
+            429,
+            json!({"error":{"message":"rate limited"}}),
+            "Retry-After: 120\r\n".into(),
+        )
+    });
+    let config: ModelConfig = serde_json::from_value(json!({"id":"fixture","name":"fixture",
+        "protocol":"openai-chat","model":"glm-5.3-flash","baseUrl":fixture.url}))
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        gateway::complete(
+            config,
+            &[message(Role::User, "fixture")],
+            &[],
+            &CancellationToken::new(),
+            |_| Ok(()),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(result.unwrap_err().to_string().contains("120 秒"));
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn glm_http_tool_round_replays_original_reasoning() {
+    let original = "\n核对现场状态。 \n";
+    let fixture = ModelFixture::new(move |request| {
+        if request["messages"].as_array().unwrap().len() == 1 {
+            let mut body = tool_calls(vec![("workspace.environment", json!({}))]);
+            body["choices"][0]["message"]["reasoning_content"] = json!(original);
+            (200, body)
+        } else {
+            (200, answer("done"))
+        }
+    });
+    let mut config: ModelConfig = serde_json::from_value(json!({"id":"fixture","name":"fixture",
+        "protocol":"openai-chat","model":"glm-5.3-flash","baseUrl":fixture.url}))
+    .unwrap();
+    config.options.reasoning_effort = Some("low".into());
+    let cancel = CancellationToken::new();
+    let mut history = vec![message(Role::User, "fixture")];
+    let first = gateway::complete(config.clone(), &history, &[], &cancel, |_| Ok(()))
+        .await
+        .unwrap();
+    let assistant = Message {
+        role: Role::Assistant,
+        content: first.text,
+        tool_call_id: None,
+        tool_calls: first.tool_calls,
+        reasoning: first.reasoning,
+    };
+    let assistant: Message =
+        serde_json::from_str(&serde_json::to_string(&assistant).unwrap()).unwrap();
+    let call_id = assistant.tool_calls[0].id.clone();
+    history.push(assistant);
+    history.push(Message {
+        role: Role::Tool,
+        content: "{}".into(),
+        tool_call_id: Some(call_id),
+        tool_calls: vec![],
+        reasoning: None,
+    });
+    let second = gateway::complete(config, &history, &[], &cancel, |_| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(second.text, "done");
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["messages"][1]["reasoning_content"], original);
+    assert_eq!(requests[1]["reasoning_effort"], "low");
+}
+
+impl Drop for ModelFixture {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take()
+            && let Err(error) = thread.join()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(error);
+        }
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> Value {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let n = stream.read(&mut buffer).unwrap();
+        assert!(n > 0);
+        bytes.extend_from_slice(&buffer[..n]);
+        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&bytes[..end]);
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    line.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                if length == 0 {
+                    return Value::Null;
+                }
+                return serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+            }
+        }
+    }
+}
+
+fn answer(text: &str) -> Value {
+    json!({"choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":100,"completion_tokens":30}})
+}
+
+fn tool_calls(calls: Vec<(&str, Value)>) -> Value {
+    json!({"choices":[{"message":{"role":"assistant","content":"","tool_calls":
+        calls.into_iter().enumerate().map(|(index,(name,args))| json!({
+            "id":format!("fixture-{index}"),"type":"function",
+            "function":{"name":gateway::wire_name(name),"arguments":args.to_string()},
+        })).collect::<Vec<_>>()},"finish_reason":"tool_calls"}]})
+}
+
+fn supervisor(fixture: &ModelFixture) -> Arc<Supervisor> {
+    let supervisor = super::record_result_tests::interrupt_supervisor("agent-runtime");
+    {
+        let mut config = supervisor.config.write().unwrap();
+        config.models[0].base_url = fixture.url.clone();
+        config.models[0].options.context_window = 16_384;
+        config.models[0].options.max_output_tokens = Some(1024);
+        config.runtime.permission_mode = operation::permissions::PermissionMode::FullAccess;
+    }
+    let root = supervisor
+        .config
+        .read()
+        .unwrap()
+        .storage
+        .database
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut tools = ToolRegistry::default();
+    workspace::register_tools(
+        &mut tools,
+        Arc::new(workspace::Workspace::from_config(
+            &root.join("user/config.json"),
+            None,
+        )),
+    )
+    .unwrap();
+    supervisor.extensions.write().unwrap().tools = Arc::new(tools);
+    supervisor
+}
+
+#[tokio::test]
+async fn followup_skill_and_real_user_inputs_are_disclosed_only_when_requested() {
+    let mut turn = 0;
+    let fixture = ModelFixture::with_empty_memory_review(move |request| {
+        turn += 1;
+        assert!(!request["tools"].as_array().unwrap().iter().any(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("runtime_scope_decision_")
+        }));
+        if turn > 1 {
+            let messages = request["messages"].to_string();
+            assert!(messages.contains("帮我兑换下国服兑换码，今天的"));
+            assert!(messages.contains("绝对有非js脚本的兑换码接口，你自己没找"));
+        }
+        (
+            200,
+            match turn {
+                1 => answer("尚未兑换。"),
+                2 => tool_calls(vec![("skills.read", json!({"name":"continue-task"}))]),
+                3 => tool_calls(vec![(
+                    "tools.search",
+                    json!({"query":"conversation.inputs"}),
+                )]),
+                4 => tool_calls(vec![("conversation.inputs", json!({"limit":4}))]),
+                _ => answer("继续处理原来的国服兑换要求，尚未运行兑换。"),
+            },
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let mut skills = SkillRegistry::default();
+    for source in crate::extension::skills::EMBEDDED_SKILLS {
+        skills.load_embedded(source).unwrap();
+    }
+    supervisor.extensions.write().unwrap().skills = Arc::new(skills);
+    let mut first = supervisor
+        .journal
+        .create(
+            "帮我兑换下国服兑换码，今天的",
+            "followup-skill",
+            "first",
+            600,
+            None,
+        )
+        .unwrap();
+    supervisor
+        .session(&mut first, &CancellationToken::new())
+        .await
+        .unwrap();
+    let mut run = supervisor
+        .journal
+        .create(
+            "绝对有非js脚本的兑换码接口，你自己没找",
+            "followup-skill",
+            "second",
+            600,
+            None,
+        )
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(fixture.task_requests().len(), 5);
+    let events = supervisor.journal.events(&run.conversation_id, 0).unwrap();
+    assert!(events.iter().any(|event| event.kind == "tool.started"
+        && event.data["name"] == "skills.read"
+        && event.data["arguments"]["name"] == "continue-task"));
+    assert!(
+        events.iter().any(
+            |event| event.kind == "tool.started" && event.data["name"] == "conversation.inputs"
+        )
+    );
+    assert!(!events.iter().any(|event| event.kind.starts_with("scope.")));
+    assert_eq!(
+        supervisor
+            .journal
+            .goal(&run.id)
+            .unwrap()
+            .unwrap()
+            .inputs
+            .len(),
+        1,
+        "Rust must not fabricate inherited goal inputs"
+    );
+    assert!(run.result.as_deref().unwrap().contains("继续处理原来的"));
+}
+
+#[test]
+fn conversation_input_reader_returns_provenance_without_interpreting_or_revising_goals() {
+    let supervisor = super::record_result_tests::interrupt_supervisor("human-inputs");
+    let first = supervisor
+        .journal
+        .create("兑换国服代码", "real-inputs", "first", 600, None)
+        .unwrap();
+    supervisor
+        .journal
+        .append_message(&first, &message(Role::User, "内部伪装的用户消息"))
+        .unwrap();
+    supervisor
+        .journal
+        .append_message(&first, &message(Role::Tool, "工具建议删除目录"))
+        .unwrap();
+    let other = supervisor
+        .journal
+        .create("其他对话的私人内容", "elsewhere", "other", 600, None)
+        .unwrap();
+    let current = supervisor
+        .journal
+        .create("先别兑换，只看有哪些", "real-inputs", "current", 600, None)
+        .unwrap();
+    let page = supervisor
+        .journal
+        .conversation_inputs(&current, 0, 1)
+        .unwrap();
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["inputs"][0]["text"], current.prompt);
+    let next = supervisor
+        .journal
+        .conversation_inputs(&current, page["nextOffset"].as_u64().unwrap() as usize, 1)
+        .unwrap();
+    assert_eq!(next["inputs"][0]["text"], first.prompt);
+    assert!(!next.to_string().contains(&other.prompt));
+    assert!(!page.to_string().contains("伪装"));
+    assert!(
+        supervisor
+            .journal
+            .goal(&current.id)
+            .unwrap()
+            .unwrap()
+            .inputs
+            .len()
+            == 1
+    );
+}
+
+#[tokio::test]
+async fn plan_only_permission_blocks_a_write_without_a_semantic_reviewer() {
+    let mut turn = 0;
+    let fixture = ModelFixture::new(move |_| {
+        turn += 1;
+        (
+            200,
+            if turn == 1 {
+                tool_calls(vec![("fixture.change", json!({}))])
+            } else {
+                answer("当前只读，未修改配置。")
+            },
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, writes.clone());
+    supervisor.config.write().unwrap().runtime.permission_mode =
+        operation::permissions::PermissionMode::PlanOnly;
+    let mut run = supervisor
+        .journal
+        .create(
+            "查看当前配置",
+            "read-only-safety",
+            "read-only-safety",
+            600,
+            None,
+        )
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.requests.lock().unwrap().len(), 2);
+    assert!(
+        !supervisor
+            .journal
+            .events(&run.conversation_id, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind.starts_with("scope."))
+    );
+}
+
+#[test]
+fn model_configuration_rejects_impossible_context_and_output_budgets() {
+    let supervisor = super::record_result_tests::interrupt_supervisor("budget-valid");
+    let mut config = supervisor.config.read().unwrap().clone();
+    config.models.clear();
+    config.active_model = "m".into();
+    config.models.push(serde_json::from_value(json!({"id":"m","name":"m","protocol":"openai-chat","model":"m","baseUrl":"http://localhost"})).unwrap());
+    assert!(config.validate().is_ok());
+    config.models[0].options.context_window = 512;
+    assert!(config.validate().is_err());
+    config.models[0].options.context_window = 8192;
+    config.models[0].options.max_output_tokens = Some(0);
+    assert!(config.validate().is_err());
+    config.models[0].options.max_output_tokens = Some(8192);
+    assert!(config.validate().is_err());
+    config.models[0].options.max_output_tokens = Some(4096);
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn model_context_redacts_legacy_credentials_without_rewriting_signed_reasoning() {
+    let supervisor = super::record_result_tests::interrupt_supervisor("credential-context");
+    let credential = "private-fixture-credential-123456";
+    supervisor.config.write().unwrap().models[0].api_key = Some(credential.into());
+    let reasoning = crate::model::Reasoning {
+        protocol: crate::config::ModelProtocol::AnthropicMessages,
+        blocks: vec![
+            json!({"type":"thinking","thinking":"核对当前任务","signature":"unaltered-signature"}),
+        ],
+        text: "核对当前任务".into(),
+    };
+    let mut assistant = message(Role::Assistant, "保留原样的回复");
+    assistant.reasoning = Some(reasoning.clone());
+    let history = vec![
+        assistant.clone(),
+        message(
+            Role::Tool,
+            json!({"value":{"text":format!("apiKey={credential}")}}).to_string(),
+        ),
+    ];
+    let projected = supervisor.model_messages(&history).unwrap();
+    assert!(!projected[1].content.contains(credential));
+    assert!(projected[1].content.contains("[REDACTED]"));
+    assert!(
+        history[1].content.contains(credential),
+        "Original local history is not modified"
+    );
+    assert_eq!(projected[0].reasoning, Some(reasoning));
+    assistant.tool_calls.push(ToolCall {
+        id: "old-unsafe-call".into(),
+        name: "fixture.run".into(),
+        arguments: json!({"key":credential}),
+    });
+    assert!(
+        supervisor.model_messages(&[assistant]).is_err(),
+        "Unsafe legacy tool parameters cannot be rewritten and replayed"
+    );
+}
+
+#[tokio::test]
+async fn stored_shortcuts_have_read_only_lookup_without_database_or_model_access() {
+    let fixture = ModelFixture::new(|_| panic!("Shortcut lookup must not request a model"));
+    let supervisor = supervisor(&fixture);
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, changes.clone());
+    let saved=supervisor.save_shortcut(&json!({"name":"已有入口","binding":{"applicationName":"Fixture","targetName":"现成配置","action":{"tool":"fixture.change","arguments":{}}}}),None).unwrap();
+    let mut run = supervisor
+        .journal
+        .create("查一下已有入口", "lookup-entry", "lookup-entry", 600, None)
+        .unwrap();
+    let config = supervisor.config.read().unwrap().clone();
+    let bridge = host::bridge::Bridge::new(config.bridge.clone()).unwrap();
+    let mut exposed = HashSet::from(["shortcut.list".into(), "shortcut.get".into()]);
+    let list = supervisor
+        .tool(
+            &mut run,
+            &ToolCall {
+                id: "list-entry".into(),
+                name: "shortcut.list".into(),
+                arguments: json!({"query":"已有"}),
+            },
+            &bridge,
+            &config.runtime,
+            &CancellationToken::new(),
+            &mut exposed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["id"], saved["taskId"]);
+    let entry = supervisor
+        .tool(
+            &mut run,
+            &ToolCall {
+                id: "get-entry".into(),
+                name: "shortcut.get".into(),
+                arguments: json!({"id":saved["taskId"]}),
+            },
+            &bridge,
+            &config.runtime,
+            &CancellationToken::new(),
+            &mut exposed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(entry["binding"]["action"]["tool"], "fixture.change");
+    assert_eq!(changes.load(Ordering::SeqCst), 0);
+    assert!(fixture.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn shortcut_save_preserves_wait_steps_without_executing_the_target() {
+    let fixture = ModelFixture::new(|_| panic!("Saving a shortcut must not request a model"));
+    let supervisor = supervisor(&fixture);
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, changes.clone());
+    let saved=supervisor.save_shortcut(&json!({"name":"有等待的入口","binding":{"applicationName":"Fixture","targetName":"顺序动作","steps":[{"title":"前项","action":{"tool":"fixture.change","arguments":{}}},{"title":"等待","waitSeconds":10},{"title":"后项","action":{"tool":"fixture.change","arguments":{}}}]}}),None).unwrap();
+    let revision = supervisor
+        .tasks
+        .published_revision(saved["taskId"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(revision.validation.publishable());
+    assert!(
+        matches!(&revision.nodes[1],operation::task::TaskNode::Wait(wait) if wait.seconds == Some(10))
+    );
+    assert_eq!(revision.shortcut.unwrap().steps[1].wait_seconds, Some(10));
+    assert_eq!(changes.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn shortcut_shell_failure_does_not_execute_the_next_command() {
+    let fixture = ModelFixture::new(|_| panic!("A saved command task must not request a model"));
+    let supervisor = supervisor(&fixture);
+    let saved = supervisor.save_shortcut(&json!({"name":"命令失败停链","binding":{"applicationName":"本机操作","targetName":"命令顺序","steps":[{"title":"失败命令","action":{"tool":"workspace.shell","arguments":{"command":"exit 3","timeoutMs":20000}}},{"title":"不应执行","action":{"tool":"workspace.shell","arguments":{"command":"Write-Output 'must-not-run'","timeoutMs":20000}}}]}}),None).unwrap();
+    let id = saved["taskId"].as_str().unwrap();
+    let revision = supervisor.tasks.published_revision(id).unwrap().unwrap();
+    let mut run = supervisor
+        .submit_workflow(id, None, "shell-failure-chain", Some(60))
+        .unwrap();
+    let config = supervisor.config.read().unwrap().clone();
+    let bridge = host::bridge::Bridge::new(config.bridge.clone()).unwrap();
+    let cancel = CancellationToken::new();
+    let state = operation::executor::TaskExecutor::new(
+        &supervisor,
+        &bridge,
+        &config.runtime,
+        &cancel,
+        &revision,
+        &mut run,
+    )
+    .run()
+    .await
+    .unwrap();
+    assert_eq!(state, RunState::Failed);
+    let events = supervisor.journal.events(&run.conversation_id, 0).unwrap();
+    let steps: Vec<_> = events
+        .iter()
+        .filter(|event| event.run_id == run.id && event.kind == "step.finished")
+        .collect();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].data["outcome"], "verifiedFailed");
+    assert_eq!(steps[1].data["outcome"], "skipped");
+    assert!(
+        run.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("退出码 3")
+    );
+}
+
+#[test]
+fn necessary_rereads_after_other_observations_are_not_a_stagnant_loop() {
+    let fixture = ModelFixture::new(|_| panic!("Recording observations must not call a model"));
+    let supervisor = supervisor(&fixture);
+    let run = supervisor
+        .journal
+        .create("核对配置", "reread", "reread", 600, None)
+        .unwrap();
+    let mut history = vec![];
+    let read = |id: &str| ToolCall {
+        id: id.into(),
+        name: "workspace.read".into(),
+        arguments: json!({"path":"config.json"}),
+    };
+    for id in ["read-1", "read-2"] {
+        supervisor
+            .record_result(
+                &run,
+                &read(id),
+                Ok(json!({"text":"same content","sha256":"same"})),
+                12000,
+                &mut history,
+            )
+            .unwrap();
+    }
+    supervisor
+        .record_result(
+            &run,
+            &ToolCall {
+                id: "other".into(),
+                name: "workspace.list".into(),
+                arguments: json!({"path":"."}),
+            },
+            Ok(json!({"entries":[{"name":"config.json"}]})),
+            12000,
+            &mut history,
+        )
+        .unwrap();
+    assert!(
+        supervisor
+            .check_progress(&run, &read("needed-reread"))
+            .is_ok()
+    );
+    assert!(
+        supervisor
+            .journal
+            .goal_conclusion(&run.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn fallback_with_smaller_window_is_not_sent_an_oversized_request() {
+    let primary = ModelFixture::new(|_| (503, json!({"error":{"message":"unavailable"}})));
+    let fallback =
+        ModelFixture::new(|_| panic!("Oversized fallback request must be rejected before HTTP"));
+    let supervisor = supervisor(&primary);
+    {
+        let mut config = supervisor.config.write().unwrap();
+        config.models[0].options.context_window = 64_000;
+        config.models.push(serde_json::from_value(json!({"id":"small","name":"small","protocol":"openai-chat","model":"fixture","baseUrl":fallback.url,"options":{"contextWindow":8192,"maxOutputTokens":1024}})).unwrap());
+        config.agent.fallback_models.push("small".into());
+    }
+    let mut run = supervisor
+        .journal
+        .create(
+            &"核对输入".repeat(2500),
+            "small-fallback",
+            "small-fallback",
+            600,
+            None,
+        )
+        .unwrap();
+    assert!(
+        supervisor
+            .session(&mut run, &CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert!(fallback.requests.lock().unwrap().is_empty());
+    assert!(
+        supervisor
+            .journal
+            .events(&run.conversation_id, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "model.fallback.skipped")
+    );
+}
+
+#[tokio::test]
+async fn truncated_tool_decisions_are_never_dispatched_or_retried() {
+    let fixture = ModelFixture::new(|_| {
+        let mut response = tool_calls(vec![("fixture.change", json!({}))]);
+        response["choices"][0]["finish_reason"] = json!("length");
+        (200, response)
+    });
+    let supervisor = supervisor(&fixture);
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, changes.clone());
+    let mut run = supervisor
+        .journal
+        .create(
+            "修改当前配置",
+            "truncated-decision",
+            "truncated-decision",
+            600,
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        supervisor
+            .session(&mut run, &CancellationToken::new())
+            .await,
+        Err(Error::ModelProtocol(_))
+    ));
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+    assert_eq!(changes.load(Ordering::SeqCst), 0);
+    assert!(supervisor.journal.attempts(&run.id).unwrap().is_empty());
+    assert!(
+        !supervisor
+            .journal
+            .events(&run.conversation_id, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "tool.started")
+    );
+}
+
+#[tokio::test]
+async fn standalone_shortcut_skill_saves_once_without_scope_model_or_execution() {
+    let fixture = ModelFixture::with_empty_memory_review(|request| {
+        let names = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&gateway::wire_name("shortcut.save").as_str()));
+        assert!(!names.contains(&gateway::wire_name("fixture.change").as_str()));
+        (
+            200,
+            tool_calls(vec![
+                (
+                    "shortcut.save",
+                    json!({"name":"已有任务入口","description":"仅保存入口，不运行",
+                "binding":{"applicationName":"Fixture","targetName":"已有任务",
+                    "action":{"tool":"fixture.change","arguments":{}}}}),
+                ),
+                ("fixture.status", json!({})),
+            ]),
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, changes.clone());
+    let mut run = supervisor
+        .journal
+        .create("$create-shortcut", "save-entry", "save-entry", 600, None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(run.state, RunState::Succeeded);
+    assert_eq!(changes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.task_requests().len(), 1);
+    let events = supervisor.journal.events(&run.conversation_id, 0).unwrap();
+    let saved = events
+        .iter()
+        .filter(|event| event.kind == "shortcut.saved")
+        .collect::<Vec<_>>();
+    assert_eq!(saved.len(), 1);
+    let id = saved[0].data["taskId"].as_str().unwrap();
+    assert_eq!(
+        supervisor.tasks.definition(id).unwrap().name,
+        "已有任务入口"
+    );
+    assert!(run.result.as_deref().unwrap().contains("尚未运行"));
+    let results = events
+        .iter()
+        .filter(|event| event.kind == "tool.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results.len(),
+        2,
+        "Skipped sibling calls must remain paired in history"
+    );
+    assert_eq!(results[1].data["result"]["ok"], false);
+    assert_eq!(
+        supervisor.journal.model_usage(&run.id).unwrap()["byPurpose"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn shortcut_schema_lists_registered_tools_without_creating_method_aliases() {
+    let supervisor = super::record_result_tests::interrupt_supervisor("binding-tools");
+    let mut tools = crate::extension::ToolRegistry::default();
+    crate::bridge::register_tools(
+        &mut tools,
+        Arc::new(crate::bridge::BgiClient::new(
+            supervisor.config.read().unwrap().bridge.clone(),
+        )),
+    )
+    .unwrap();
+    supervisor.extensions.write().unwrap().tools = Arc::new(tools);
+    let definitions = supervisor.tool_definitions();
+    for name in ["shortcut.save", "task.save"] {
+        let schema = &definitions
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap()
+            .input_schema;
+        let names = schema
+            .pointer("/properties/binding/properties/action/properties/tool/enum")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(names.contains(&json!("bgi.api.invoke")));
+        assert!(!names.contains(&json!("bgi.run_script_group")));
+        assert!(!names.contains(&json!("shortcut.save")));
+        assert!(
+            names
+                .iter()
+                .all(|name| definitions.iter().any(|tool| name == &tool.name))
+        );
+    }
+}
+
+#[tokio::test]
+async fn observed_game_state_does_not_adjudicate_explicit_shortcut_saves_or_repairs() {
+    for repair in [false, true] {
+        let mut turn = 0;
+        let fixture = ModelFixture::with_empty_memory_review(move |request| {
+            turn += 1;
+            if turn == 1 {
+                return (200, tool_calls(vec![("fixture.status", json!({}))]));
+            }
+            if repair && turn == 3 {
+                let reply = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"] == "tool")
+                    .unwrap();
+                let reply: Value =
+                    serde_json::from_str(reply["content"].as_str().unwrap()).unwrap();
+                assert_eq!(reply["ok"], false);
+                assert!(reply["error"].as_str().unwrap().contains("未登记"));
+            }
+            (
+                200,
+                tool_calls(vec![(
+                    "shortcut.save",
+                    json!({"name":"existing","binding":{"applicationName":"Fixture","targetName":"existing","action":{"tool":if repair && turn == 2 { "application.method" } else { "fixture.change" },"arguments":{}}}}),
+                )]),
+            )
+        });
+        let supervisor = supervisor(&fixture);
+        let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        install_status_slice(&supervisor, changes.clone());
+        let mut run = supervisor
+            .journal
+            .create("$create-shortcut", "state-save", "state-save", 600, None)
+            .unwrap();
+        supervisor
+            .session(&mut run, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            run.state,
+            RunState::Succeeded,
+            "repair={repair}: {:?}",
+            run.result
+        );
+        assert_eq!(changes.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.task_requests().len(), if repair { 3 } else { 2 });
+        let events = supervisor.journal.events(&run.conversation_id, 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "shortcut.saved")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event.kind == "scope.reviewed"));
+        let usage = supervisor.journal.model_usage(&run.id).unwrap();
+        assert!(
+            usage["byPurpose"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["purpose"] == "foreground" || item["purpose"] == "memory")
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_shortcut_tool_can_be_corrected_without_starting_the_target() {
+    let mut turn = 0;
+    let fixture = ModelFixture::with_empty_memory_review(move |request| {
+        turn += 1;
+        if turn == 2 {
+            let result = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "tool")
+                .unwrap();
+            let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+            assert_eq!(result["ok"], false);
+        }
+        (
+            200,
+            tool_calls(vec![(
+                "shortcut.save",
+                json!({"name":"existing","binding":{"applicationName":"Fixture","targetName":"existing","action":{"tool":if turn == 1 { "application.method" } else { "fixture.change" },"arguments":{}}}}),
+            )]),
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, changes.clone());
+    let mut run = supervisor
+        .journal
+        .create(
+            "$create-shortcut",
+            "correct-entry",
+            "correct-entry",
+            600,
+            None,
+        )
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(run.state, RunState::Succeeded);
+    assert_eq!(changes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.task_requests().len(), 2);
+    let events = supervisor.journal.events(&run.conversation_id, 0).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "shortcut.saved")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn bgi_mcp_state_then_shortcut_repair_saves_without_review_or_game_calls() {
+    let native = ModelFixture::new(|body| {
+        assert!(body.is_null(), "保存入口不能向 BetterGI 提交执行请求");
+        (
+            200,
+            json!({"instanceId":"fixture","bridgeReady":false,"runtime":{"hostLoaded":true,"captureReady":false,"gameProcessRunning":false}}),
+        )
+    });
+    let mut turn = 0;
+    let model = ModelFixture::with_empty_memory_review(move |_request| {
+        turn += 1;
+        if turn == 1 {
+            return (200, tool_calls(vec![("bgi.state.get", json!({}))]));
+        }
+        let action = if turn == 2 {
+            json!({"tool":"bgi.run_script_group","arguments":{"groupName":"千星","waitForCompletion":false}})
+        } else {
+            json!({"tool":"bgi.api.invoke","arguments":{"methodId":"bgi.run_script_group","arguments":{"groupName":"千星","waitForCompletion":false}}})
+        };
+        (
+            200,
+            tool_calls(vec![(
+                "shortcut.save",
+                json!({"name":"千星","binding":{"applicationName":"BetterGI","targetName":"千星","action":action}}),
+            )]),
+        )
+    });
+    let supervisor = supervisor(&model);
+    let mut config = supervisor.config.read().unwrap().bridge.clone();
+    config.enabled = true;
+    config.base_url = native.url.trim_end_matches("/v1").into();
+    let transport = Arc::new(host::bridge::Bridge::for_transport_tests(config.clone()).unwrap());
+    let mut original = ToolRegistry::default();
+    crate::bridge::register_tools(
+        &mut original,
+        Arc::new(crate::bridge::BgiClient::new(config)),
+    )
+    .unwrap();
+    let server = crate::extension::mcp_server::RegistryServer::new(original, "bgi", "")
+        .with_internal(crate::bridge::mcp::transport_tools(transport).unwrap());
+    let endpoint = serde_json::from_value(
+        json!({"id":"bridge","transport":"inProcess","server":"bgi","timeoutMs":2000}),
+    )
+    .unwrap();
+    let client = crate::extension::mcp::McpClient::in_process(&endpoint, server).unwrap();
+    let mut tools = ToolRegistry::default();
+    tools.register_mcp("bgi", "bridge", client.clone());
+    for tool in client
+        .list_tools("bgi", "bridge", "1", &std::collections::HashMap::new())
+        .unwrap()
+    {
+        tools.register_shared(tool).unwrap();
+    }
+    supervisor.extensions.write().unwrap().tools = Arc::new(tools);
+    let mut run = supervisor
+        .journal
+        .create(
+            "$create-shortcut",
+            "mcp-state-save",
+            "mcp-state-save",
+            600,
+            None,
+        )
+        .unwrap();
+    crate::runtime::executor()
+        .block_on(supervisor.session(&mut run, &CancellationToken::new()))
+        .unwrap();
+    assert_eq!(run.state, RunState::Succeeded);
+    assert_eq!(model.task_requests().len(), 3);
+    assert_eq!(
+        native.requests.lock().unwrap().len(),
+        1,
+        "只能读取状态，不能启动或准备游戏"
+    );
+    let events = supervisor.journal.events(&run.conversation_id, 0).unwrap();
+    assert!(!events.iter().any(|event| event.kind == "scope.reviewed"));
+    let saved = events
+        .iter()
+        .find(|event| event.kind == "shortcut.saved")
+        .unwrap();
+    let entry = supervisor
+        .tasks
+        .published_revision(saved.data["taskId"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let action = entry.shortcut.unwrap().action.unwrap();
+    assert_eq!(action.tool, "bgi.api.invoke");
+    assert_eq!(action.arguments["methodId"], "bgi.run_script_group");
+    assert_eq!(action.arguments["arguments"]["groupName"], "千星");
+}
+
+#[test]
+fn shortcut_skill_admission_requires_current_standalone_human_input() {
+    let supervisor = super::record_result_tests::interrupt_supervisor("shortcut-intent");
+    let run = supervisor
+        .journal
+        .create(
+            "只看看配置",
+            "shortcut-intent",
+            "shortcut-intent",
+            600,
+            None,
+        )
+        .unwrap();
+    supervisor
+        .journal
+        .append_message(&run, &message(Role::Context, "$create-shortcut"))
+        .unwrap();
+    assert!(!supervisor.shortcut_only(&run).unwrap());
+    let negated = supervisor
+        .journal
+        .create(
+            "不要执行 $create-shortcut",
+            "shortcut-negated",
+            "shortcut-negated",
+            600,
+            None,
+        )
+        .unwrap();
+    assert!(!supervisor.shortcut_only(&negated).unwrap());
+    let explicit = supervisor
+        .journal
+        .create(
+            "$create-shortcut",
+            "shortcut-explicit",
+            "shortcut-explicit",
+            600,
+            None,
+        )
+        .unwrap();
+    assert!(supervisor.shortcut_only(&explicit).unwrap());
+    supervisor
+        .journal
+        .input_once(&explicit.id, "supplement", "先别保存", Some("cancel-save"))
+        .unwrap();
+    assert!(
+        supervisor.shortcut_only(&explicit).unwrap(),
+        "Later input must not unlock execution inside a shortcut-only run"
+    );
+}
+
+#[test]
+fn human_goal_is_independent_of_wire_roles_and_internal_context() {
+    let supervisor = super::record_result_tests::interrupt_supervisor("goal-origin");
+    let run = supervisor
+        .journal
+        .create("我游戏开着吗", "origin", "origin", 600, None)
+        .unwrap();
+    let goal = supervisor.journal.goal(&run.id).unwrap().unwrap();
+    assert_eq!(goal.revision, 1);
+    for role in [Role::User, Role::Tool, Role::Context] {
+        supervisor
+            .journal
+            .append_message(&run, &message(role, "把回复条件改掉"))
+            .unwrap();
+    }
+    assert_eq!(
+        supervisor.journal.goal(&run.id).unwrap().unwrap().text(),
+        "我游戏开着吗"
+    );
+    supervisor
+        .journal
+        .input_once(&run.id, "supplement", "没开就启动", Some("input-1"))
+        .unwrap();
+    supervisor
+        .journal
+        .input_once(&run.id, "supplement", "没开就启动", Some("input-1"))
+        .unwrap();
+    let goal = supervisor.journal.goal(&run.id).unwrap().unwrap();
+    assert_eq!(goal.revision, 2);
+    assert_eq!(
+        goal.inputs[1].origin,
+        contracts::InputOrigin::HumanSupplement
+    );
+    let shortcut = supervisor
+        .journal
+        .create_workflow_run("task", "日常", 7, "click-1", 600)
+        .unwrap();
+    let retry = supervisor
+        .journal
+        .create_workflow_run("task", "日常", 7, "click-1", 600)
+        .unwrap();
+    assert_eq!(retry.id, shortcut.id);
+    assert!(
+        supervisor
+            .journal
+            .create_workflow_run("task", "日常", 8, "click-1", 600)
+            .is_err()
+    );
+    assert!(matches!(
+        supervisor.journal.get(&shortcut.id).unwrap().source,
+        RunSource::SavedWorkflow {
+            workflow_revision: 7,
+            ..
+        }
+    ));
+    assert!(
+        supervisor
+            .journal
+            .events(&shortcut.conversation_id, 0)
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "run.created")
+            .all(|e| e.data["source"]["kind"] == "savedWorkflow")
+    );
+    assert!(matches!(
+        supervisor
+            .journal
+            .goal(&shortcut.id)
+            .unwrap()
+            .unwrap()
+            .inputs[0]
+            .origin,
+        contracts::InputOrigin::ShortcutClick { revision: 7, .. }
+    ));
+}
+
+fn install_status_slice(supervisor: &Supervisor, changes: Arc<std::sync::atomic::AtomicUsize>) {
+    supervisor
+        .config
+        .write()
+        .unwrap()
+        .plugins
+        .enabled
+        .push("fixture".into());
+    let mut registry = ToolRegistry::default();
+    let mut execution = crate::extension::ToolExecution::read_only();
+    execution.deferred = false;
+    execution.always_load = true;
+    execution.goal_observation = Some(Box::new(crate::extension::GoalObservationSpec {
+        pointer: "/value/running".into(),
+        meaning: "游戏进程是否运行".into(),
+        when_true: "游戏开着".into(),
+        when_false: "游戏没开".into(),
+    }));
+    registry
+        .register(
+            crate::extension::FunctionTool::new(
+                "fixture.status",
+                "读取游戏进程",
+                json!({"type":"object"}),
+                "plugin:fixture",
+                |_| Ok(json!({"running":false})),
+            )
+            .with_execution(execution),
+        )
+        .unwrap();
+    registry
+        .register(
+            crate::extension::FunctionTool::new(
+                "fixture.change",
+                "修改当前配置",
+                json!({"type":"object","properties":{"checked":{"type":"boolean"}}}),
+                "plugin:fixture",
+                move |_| {
+                    changes.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"verified":true}))
+                },
+            )
+            .with_execution(crate::extension::ToolExecution {
+                effect: ToolEffect::LocalWrite,
+                deferred: false,
+                always_load: true,
+                model_usage: crate::extension::ModelUsage::None,
+                exposure: crate::extension::ToolExposure::Always,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    supervisor.extensions.write().unwrap().tools = Arc::new(registry);
+}
+
+#[tokio::test]
+async fn repeated_identical_calls_report_to_main_model_without_concluding_task() {
+    let mut turn = 0;
+    let fixture = ModelFixture::with_empty_memory_review(move |request| {
+        turn += 1;
+        if turn <= 3 {
+            return (200, tool_calls(vec![("workspace.environment", json!({}))]));
+        }
+        let result = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "tool")
+            .unwrap();
+        let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["ok"], false);
+        assert!(result["error"].as_str().unwrap().contains("没有带来进展"));
+        (200, answer("已取得当前环境，无需重复读取。"))
+    });
+    let supervisor = supervisor(&fixture);
+    supervisor
+        .config
+        .write()
+        .unwrap()
+        .runtime
+        .max_stagnant_calls = 2;
+    let mut run = supervisor
+        .journal
+        .create("查看当前环境", "no-progress", "no-progress", 600, None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(run.state, RunState::Answered);
+    assert_eq!(
+        run.result.as_deref(),
+        Some("已取得当前环境，无需重复读取。")
+    );
+    assert_eq!(fixture.task_requests().len(), 4);
+    assert!(
+        supervisor
+            .journal
+            .goal_conclusion(&run.id)
+            .unwrap()
+            .is_none()
+    );
+    let results = supervisor.journal.goal_receipts(&run.id, 1).unwrap();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| r.state == contracts::ReceiptState::Observed)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn changed_human_goal_blocks_an_already_generated_write() {
+    let target = Arc::new(Mutex::new(None::<(Arc<Journal>, String)>));
+    let input_target = target.clone();
+    let fixture = ModelFixture::new(move |request| {
+        if request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "tool")
+        {
+            return (200, answer("已按新要求停止"));
+        }
+        let (journal, id) = input_target.lock().unwrap().clone().unwrap();
+        journal
+            .input_once(&id, "supplement", "只查看，不要修改", Some("steer"))
+            .unwrap();
+        (200, tool_calls(vec![("fixture.change", json!({}))]))
+    });
+    let supervisor = supervisor(&fixture);
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, writes.clone());
+    let mut run = supervisor
+        .journal
+        .create("修改配置", "revision", "revision", 600, None)
+        .unwrap();
+    *target.lock().unwrap() = Some((supervisor.journal.clone(), run.id.clone()));
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    let receipts = supervisor.journal.goal_receipts(&run.id, 1).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].state, contracts::ReceiptState::Failed);
+    assert!(
+        supervisor
+            .journal
+            .goal_receipts(&run.id, 2)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn ack_recovery_reuses_exact_wire_only_in_the_original_idempotent_instance() {
+    for (idempotent, same_instance) in [(true, true), (false, true), (true, false)] {
+        let fixture = ModelFixture::new(move |body| {
+            (
+                200,
+                if body.is_null() {
+                    json!({"instanceId":if same_instance {"instance-1"} else {"instance-2"},"protocolVersion":"1","features":["jobs","idempotency"]})
+                } else {
+                    json!({"jobId":"original-job","replayed":true})
+                },
+            )
+        });
+        let supervisor = supervisor(&fixture);
+        let mut run = supervisor
+            .journal
+            .create("运行已有任务", "ack", "ack", 600, None)
+            .unwrap();
+        supervisor
+            .journal
+            .save(&mut run, RunState::Deciding)
+            .unwrap();
+        supervisor
+            .journal
+            .save(&mut run, RunState::Executing)
+            .unwrap();
+        let mut attempt = supervisor
+            .journal
+            .prepare(&run, "lost-call", json!({}), "instance-1")
+            .unwrap();
+        let wire = json!({"requestId":attempt.id,"instanceId":"instance-1","catalogVersion":"v1","methodId":"run","arguments":{"name":"task"}});
+        attempt.request = json!({"wire":wire,"bridgeFeatures":if idempotent {json!(["idempotency"])} else {json!([])}});
+        attempt.request_hash = hash(&wire);
+        attempt.outcome = "unknown".into();
+        supervisor.journal.attempt(&attempt).unwrap();
+        let bridge=host::bridge::Bridge::for_transport_tests(serde_json::from_value(json!({"enabled":true,"baseUrl":fixture.url.trim_end_matches("/v1"),"timeoutMs":2000})).unwrap()).unwrap();
+        let result = bridge
+            .recover_ack(&supervisor.journal, &mut attempt, &CancellationToken::new())
+            .await;
+        let sent = fixture.requests.lock().unwrap();
+        if idempotent && same_instance {
+            result.unwrap();
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[1], wire);
+            assert_eq!(attempt.job_id.as_deref(), Some("original-job"));
+        } else {
+            assert!(result.is_err());
+            assert_eq!(sent.len(), 1);
+            assert_eq!(attempt.outcome, "unknown");
+        }
+    }
+}
+
+#[tokio::test]
+async fn interface_search_preserves_requested_source_and_parameters() {
+    let native = ModelFixture::new(|request| {
+        assert!(
+            request.is_null(),
+            "Catalog lookup is a GET without a request body"
+        );
+        (
+            200,
+            json!({"items":[{"methodId":"cmd.feed_window.auto_redeem_item"}],"total":1}),
+        )
+    });
+    let bridge = host::bridge::Bridge::for_transport_tests(
+        serde_json::from_value(json!({"enabled":true,"baseUrl":native.url})).unwrap(),
+    )
+    .unwrap();
+    let result = crate::bridge::retrieval::search_interface(
+        &json!({"query":"兑换码","offset":3,"limit":2,"group":"command"}),
+        &bridge,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result["items"][0]["methodId"],
+        "cmd.feed_window.auto_redeem_item"
+    );
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn live_feature_cards_distinguish_current_operations_from_script_reference() {
+    let number = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = number.clone();
+    let fixture = ModelFixture::new(move |_| {
+        let n = seen.fetch_add(1, Ordering::SeqCst) % 3;
+        (
+            200,
+            json!({"instanceId":"instance-1","catalogVersion":"v1","callable":n!=2,"effect":if n==0 {"readOnly"} else {"configurationWrite"},"guide":{"verification":"readBack"},"inputSchema":{"type":"object"}}),
+        )
+    });
+    let bridge = host::bridge::Bridge::for_transport_tests(
+        serde_json::from_value(json!({"enabled":true,"baseUrl":fixture.url})).unwrap(),
+    )
+    .unwrap();
+    let card = json!({"item":{"kind":"workflow","methodIds":["bgi.read","bgi.write","cmd.old"]}});
+    let result = crate::bridge::features::inspect_live(card, 0, &bridge, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result["capabilityState"], "unavailable");
+    assert_eq!(result["contracts"][0]["route"], "bgi.api.read");
+    assert_eq!(result["contracts"][1]["route"], "bgi.api.invoke");
+    assert_eq!(result["contracts"][2]["state"], "unavailable");
+    assert_eq!(result["contracts"][2]["priority"], "uiFallback");
+    assert!(result["snapshotConsistent"].as_bool().unwrap());
+    let js = json!({"item":{"kind":"scriptApi","methodIds":["bgi.js_api.read"]}});
+    let result = crate::bridge::features::inspect_live(js, 0, &bridge, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result["capabilityState"], "referenceOnly");
+}
+
+#[test]
+fn old_memory_cannot_survive_inside_a_compaction_summary() {
+    let supervisor = super::record_result_tests::interrupt_supervisor("summary-memory-epoch");
+    let run = supervisor
+        .journal
+        .create("真实用户目标", "summary", "summary", 600, None)
+        .unwrap();
+    supervisor
+        .journal
+        .append_message(&run, &message(Role::Assistant, "原始事实记录"))
+        .unwrap();
+    let entries = supervisor.journal.history_window(&run).unwrap().1;
+    let boundary = entries.last().unwrap();
+    let plan = context::CompactionPlan {
+        through_sort_key: boundary.sort_key,
+        through_message_id: boundary.id,
+        source: entries.iter().map(|e| e.message.clone()).collect(),
+    };
+    supervisor
+        .journal
+        .save_compaction(&run, &plan, "旧记忆摘要", 0, 0, 0)
+        .unwrap();
+    assert!(
+        supervisor
+            .journal
+            .history(&run)
+            .unwrap()
+            .iter()
+            .any(|m| m.content.contains("旧记忆摘要"))
+    );
+    let db =
+        rusqlite::Connection::open(&supervisor.config.read().unwrap().storage.database).unwrap();
+    db.execute("UPDATE runtime_memory_meta SET edit_epoch=edit_epoch+1", [])
+        .unwrap();
+    let history = supervisor.journal.history(&run).unwrap();
+    assert!(history.iter().all(|m| !m.content.contains("旧记忆摘要")));
+    assert!(history.iter().any(|m| m.content == "原始事实记录"));
+    supervisor
+        .journal
+        .save_compaction(&run, &plan, "迟到的旧摘要", 0, 0, 0)
+        .unwrap();
+    assert!(
+        supervisor
+            .journal
+            .history(&run)
+            .unwrap()
+            .iter()
+            .all(|m| !m.content.contains("迟到的旧摘要"))
+    );
+    supervisor
+        .journal
+        .save_compaction(&run, &plan, "重新生成的摘要", 0, 0, 1)
+        .unwrap();
+    assert!(
+        supervisor
+            .journal
+            .history(&run)
+            .unwrap()
+            .iter()
+            .any(|m| m.content.contains("重新生成的摘要"))
+    );
+    assert_eq!(
+        supervisor.journal.goal(&run.id).unwrap().unwrap().text(),
+        "真实用户目标"
+    );
+}
+
+#[tokio::test]
+async fn discarded_memory_response_is_charged_without_blocking_foreground() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let observed = entered.clone();
+    let finish = release.clone();
+    let fixture = ModelFixture::new(move |_| {
+        observed.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !finish.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (200, answer(r#"{"goalRelevant":true,"experiences":[]}"#))
+    });
+    let supervisor = supervisor(&fixture);
+    let mut run = supervisor
+        .journal
+        .create("读取脚本配置", "learning", "learning", 600, None)
+        .unwrap();
+    supervisor
+        .journal
+        .save(&mut run, RunState::Deciding)
+        .unwrap();
+    let mut history = Vec::new();
+    for (index, name) in ["workspace.environment", "workspace.read"]
+        .iter()
+        .enumerate()
+    {
+        let call = ToolCall {
+            id: format!("read-{index}"),
+            name: (*name).into(),
+            arguments: json!({"path":"script.json"}),
+        };
+        let mut request = message(Role::Assistant, "");
+        request.tool_calls.push(call.clone());
+        supervisor.journal.append_message(&run, &request).unwrap();
+        supervisor
+            .record_result(
+                &run,
+                &call,
+                Ok(json!({"content":"script config","sha256":"observed"})),
+                12000,
+                &mut history,
+            )
+            .unwrap();
+    }
+    admit_memory_learning(&supervisor, &run, &["read-0", "read-1"]);
+    supervisor
+        .journal
+        .finish(&mut run, RunState::Answered)
+        .unwrap();
+    supervisor
+        .memory
+        .enqueue(&run, "learning-implementation")
+        .unwrap();
+    supervisor.memory.claim_learning(&run.id).unwrap();
+    let cancel = CancellationToken::new();
+    let cancelling = cancel.clone();
+    let learner = supervisor.clone();
+    let id = run.id.clone();
+    let worker = tokio::spawn(async move {
+        learner
+            .learn_experience(&id, &cancelling, &CancellationToken::new())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let foreground_lock =
+        tokio::time::timeout(Duration::from_millis(100), supervisor.model_gate.read()).await;
+    cancel.cancel();
+    release.store(true, Ordering::SeqCst);
+    assert!(
+        foreground_lock.is_ok(),
+        "background learner must not own the foreground/config writer gate"
+    );
+    let (count, input, output) = worker.await.unwrap().unwrap();
+    assert_eq!((count, input, output), (0, 100, 30));
+    supervisor
+        .memory
+        .finish_learning(&run.id, true, input, output)
+        .unwrap();
+    let usage = supervisor.journal.model_usage(&run.id).unwrap();
+    assert_eq!(usage["byPurpose"][0]["purpose"], "memory");
+    assert_eq!(usage["byPurpose"][0]["inputTokens"], 100);
+    assert_eq!(usage["byPurpose"][0]["estimated"], false);
+    assert!(supervisor.memory.pending().unwrap().is_none());
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn wide_tool_results_keep_bounded_evidence_and_verification() {
+    let mut value = json!({"outcome":"verifiedSucceeded","verification":{"status":"succeeded"},"value":{"total":0,"items":[]}});
+    for index in 0..10_000 {
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(format!("field-{index}"), json!("some data"));
+    }
+    let evidence = context::tool_evidence(&value);
+    assert!(evidence.to_string().len() < 8000);
+    assert_eq!(evidence["verification"]["status"], "succeeded");
+    assert_eq!(evidence["value"]["total"], 0);
+    assert_eq!(evidence["evidenceTruncated"], true);
+}
+
+#[tokio::test]
+async fn malformed_arguments_after_observation_do_not_spend_scope_review_tokens() {
+    let mut turn = 0;
+    let fixture = ModelFixture::with_empty_memory_review(move |_request| {
+        turn += 1;
+        (
+            200,
+            match turn {
+                1 => tool_calls(vec![("fixture.status", json!({}))]),
+                2 => tool_calls(vec![("fixture.change", json!({"checked":"invalid"}))]),
+                _ => answer("游戏没开；参数不正确的操作没有执行。"),
+            },
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, changes.clone());
+    let mut run = supervisor
+        .journal
+        .create(
+            "查看游戏状态",
+            "invalid-after-state",
+            "invalid-after-state",
+            600,
+            None,
+        )
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(run.state, RunState::Answered);
+    assert_eq!(changes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.task_requests().len(), 3);
+    let usage = supervisor.journal.model_usage(&run.id).unwrap();
+    assert!(
+        usage["byPurpose"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["purpose"] == "foreground" || entry["purpose"] == "memory")
+    );
+}
+
+#[tokio::test]
+async fn native_observation_does_not_finish_an_explicit_conditional_task() {
+    let fixture = ModelFixture::new(|request| {
+        let count = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .count();
+        (
+            200,
+            match count {
+                0 => tool_calls(vec![("fixture.status", json!({}))]),
+                1 => tool_calls(vec![("fixture.change", json!({}))]),
+                _ => answer("已按条件修改"),
+            },
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    install_status_slice(&supervisor, changes.clone());
+    let mut run = supervisor
+        .journal
+        .create(
+            "先查游戏，没开就修改配置",
+            "compound",
+            "compound",
+            600,
+            None,
+        )
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(changes.load(Ordering::SeqCst), 1);
+    assert!(
+        supervisor
+            .journal
+            .goal_conclusion(&run.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+fn admit_memory_learning(supervisor: &Supervisor, run: &Run, evidence: &[&str]) {
+    let args = json!({"reason":"已验证一个稳定的参数来源约束，会改变今后同类任务取得参数的方式","evidenceCallIds":evidence});
+    let result = supervisor.request_memory_learning(run, &args).unwrap();
+    let mut call = message(Role::Assistant, "");
+    call.tool_calls = vec![ToolCall {
+        id: "learn-admission".into(),
+        name: "memory.learn".into(),
+        arguments: args,
+    }];
+    supervisor.journal.append_message(run, &call).unwrap();
+    let mut response = message(Role::Tool, json!({"ok":true,"value":result}).to_string());
+    response.tool_call_id = Some("learn-admission".into());
+    supervisor.journal.append_message(run, &response).unwrap();
+}
+
+#[tokio::test]
+async fn verified_experience_is_learned_and_recalled_in_a_new_conversation() {
+    let location = Arc::new(Mutex::new(String::new()));
+    let read_location = location.clone();
+    let fixture = ModelFixture::new(move |request| {
+        let system = request["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default();
+        if system.starts_with("你负责提炼可复用的操作经验") {
+            return (200,answer(&json!({"goalRelevant":true,"experiences":[{
+                "intent":"读取脚本当前配置","summary":"先取得当前软件根，再读取本次目标配置；不把上次路径当成本次目标。",
+                "keywords":["脚本","配置"],"conditions":["本次请求需要读取脚本配置，目标文件已定位"],
+                "steps":[{"tool":"workspace.environment","action":"读取当前软件根与可用环境","inputRoles":{}},
+                    {"tool":"workspace.read","action":"读取本次脚本的当前配置","inputRoles":{"path":"本次已验证的目标文件"}}],
+                "verification":["以本轮读取到的内容和版本为准"],"pitfalls":["旧路径不存在或对象不同就重新定位"],"anchors":[]
+            }]}).to_string()));
+        }
+        if request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("历史操作经验资料"))
+            })
+        {
+            return (200, answer("先按当前目标核对经验条件"));
+        }
+        if request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool")
+        {
+            return (200, answer("已读取现场配置"));
+        }
+        (
+            200,
+            tool_calls(vec![
+                ("workspace.environment", json!({})),
+                (
+                    "workspace.read",
+                    json!({"path":read_location.lock().unwrap().clone()}),
+                ),
+            ]),
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let root = supervisor
+        .config
+        .read()
+        .unwrap()
+        .storage
+        .database
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = root.join("script-config.json");
+    std::fs::write(&path, "{\"enabled\":true}").unwrap();
+    *location.lock().unwrap() = path.to_string_lossy().into_owned();
+    let cancel = CancellationToken::new();
+    let mut first = supervisor
+        .journal
+        .create("读取脚本配置", "first", "first", 600, None)
+        .unwrap();
+    supervisor.session(&mut first, &cancel).await.unwrap();
+    assert_eq!(first.state, RunState::Answered);
+    assert_eq!(supervisor.memory.list(10).unwrap().len(), 1);
+    assert_eq!(
+        supervisor
+            .memory
+            .learning_status(&first.id)
+            .unwrap()
+            .as_deref(),
+        Some("complete")
+    );
+    let mut second = supervisor
+        .journal
+        .create("读取另一个脚本配置", "second", "second", 600, None)
+        .unwrap();
+    supervisor.session(&mut second, &cancel).await.unwrap();
+    let history = supervisor.journal.run_history(&second).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count(),
+        1
+    );
+    assert!(history.iter().any(
+        |message| message.role == Role::Context && message.content.contains("读取脚本当前配置")
+    ));
+    let requests = fixture.requests.lock().unwrap();
+    assert!(
+        requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(CORE_AGENT_POLICY),
+        "真实请求必须使用精简后的常驻指令"
+    );
+    assert_eq!(
+        requests[0]["messages"][0],
+        requests.last().unwrap()["messages"][0]
+    );
+    assert!(
+        !requests
+            .last()
+            .unwrap()
+            .to_string()
+            .contains(path.to_string_lossy().as_ref())
+    );
+    drop(requests);
+    supervisor.shutdown();
+}
+
+#[tokio::test]
+async fn disabling_memory_discards_an_inflight_result_but_keeps_its_usage() {
+    let target = Arc::new(Mutex::new(None::<std::sync::Weak<Supervisor>>));
+    let control = target.clone();
+    let fixture = ModelFixture::new(move |_| {
+        control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .update_memory_enabled(false)
+            .unwrap();
+        (200, answer("{\"goalRelevant\":true,\"experiences\":[]}"))
+    });
+    let supervisor = supervisor(&fixture);
+    *target.lock().unwrap() = Some(Arc::downgrade(&supervisor));
+    let mut run = supervisor
+        .journal
+        .create("读取当前脚本配置", "memory-off", "memory-off", 600, None)
+        .unwrap();
+    supervisor
+        .journal
+        .save(&mut run, RunState::Deciding)
+        .unwrap();
+    let mut assistant = message(Role::Assistant, "");
+    assistant.tool_calls = vec![
+        ToolCall {
+            id: "env".into(),
+            name: "workspace.environment".into(),
+            arguments: json!({}),
+        },
+        ToolCall {
+            id: "read".into(),
+            name: "workspace.read".into(),
+            arguments: json!({"path":"current.json"}),
+        },
+    ];
+    supervisor.journal.append_message(&run, &assistant).unwrap();
+    for id in ["env", "read"] {
+        let mut result = message(
+            Role::Tool,
+            json!({"ok":true,"value":{"current":true}}).to_string(),
+        );
+        result.tool_call_id = Some(id.into());
+        supervisor.journal.append_message(&run, &result).unwrap();
+    }
+    admit_memory_learning(&supervisor, &run, &["env", "read"]);
+    supervisor
+        .journal
+        .save(&mut run, RunState::Answered)
+        .unwrap();
+    let result = supervisor
+        .learn_experience(
+            &run.id,
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, (0, 100, 30));
+    assert!(supervisor.memory.list(10).unwrap().is_empty());
+    let usage = supervisor.journal.model_usage(&run.id).unwrap();
+    assert_eq!(usage["byPurpose"][0]["purpose"], "memory");
+    assert_eq!(usage["byPurpose"][0]["requests"], 1);
+    assert_eq!(usage["byPurpose"][0]["inputTokens"], 100);
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+    let skipped = supervisor
+        .learn_experience(
+            &run.id,
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(skipped, (0, 0, 0));
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+    supervisor.shutdown();
+}
+
+#[test]
+fn memory_admission_uses_model_judgment_and_does_not_generate_rust_memories() {
+    let fixture = ModelFixture::new(|_| (200, answer("unused")));
+    let supervisor = supervisor(&fixture);
+    let mut run = supervisor
+        .journal
+        .create(
+            "修改脚本配置",
+            "trace-conversation",
+            "trace-client",
+            600,
+            None,
+        )
+        .unwrap();
+    supervisor
+        .journal
+        .save(&mut run, RunState::Deciding)
+        .unwrap();
+    let mut assistant = message(Role::Assistant, "");
+    assistant.tool_calls = vec![
+        ToolCall {
+            id: "read".into(),
+            name: "workspace.read".into(),
+            arguments: json!({"path":"current-config.json"}),
+        },
+        ToolCall {
+            id: "write".into(),
+            name: "workspace.write".into(),
+            arguments: json!({"path":"current-config.json","expectedHash":"old-value-not-for-reuse","text":"new config"}),
+        },
+    ];
+    supervisor.journal.append_message(&run, &assistant).unwrap();
+    for (id, value) in [
+        (
+            "read",
+            json!({"content":"old config","version":"old-value-not-for-reuse"}),
+        ),
+        ("write", json!({"written":true})),
+    ] {
+        let mut result = message(Role::Tool, json!({"ok":true,"value":value}).to_string());
+        result.tool_call_id = Some(id.into());
+        supervisor.journal.append_message(&run, &result).unwrap();
+    }
+    supervisor
+        .journal
+        .save(&mut run, RunState::Answered)
+        .unwrap();
+    // 没有前台申请也应进入复盘，但 Rust 不生成经验正文。
+    supervisor.enqueue_experience_learning(&run).unwrap();
+    assert!(!supervisor.memory_learning_requested(&run).unwrap());
+    assert!(
+        supervisor
+            .request_memory_learning(&run, &json!({"reason":"普通任务完成"}))
+            .is_err()
+    );
+    assert!(
+        supervisor
+            .request_memory_learning(
+                &run,
+                &json!({
+                    "reason":"已验证的入口值得复用", "evidenceCallIds":["invented"]
+                })
+            )
+            .is_err()
+    );
+    let db =
+        rusqlite::Connection::open(&supervisor.config.read().unwrap().storage.database).unwrap();
+    let queued: u64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM runtime_memory_learning WHERE run_id=?1",
+            [&run.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        queued, 1,
+        "真实观测应进入后台评估，不要求前台显式调用 memory.learn"
+    );
+    drop(db);
+    admit_memory_learning(&supervisor, &run, &["read", "write"]);
+    let duplicate=supervisor.request_memory_learning(&run,&json!({"reason":"同一发现不应在本轮再次申请提炼并增加额外消耗","evidenceCallIds":["read","write"]})).unwrap();
+    assert_eq!(duplicate["duplicate"], true);
+    supervisor.enqueue_experience_learning(&run).unwrap();
+    assert_eq!(supervisor.memory.pending().unwrap(), Some(run.id.clone()));
+    assert!(
+        supervisor
+            .recall_memories("修改另一个脚本配置")
+            .unwrap()
+            .is_empty(),
+        "申请记忆不会用 Rust 自动拼接记忆正文"
+    );
+    supervisor.shutdown();
+}
+
+#[tokio::test]
+async fn one_observation_can_be_learned_while_the_overall_task_needs_review() {
+    let fixture = ModelFixture::new(|_| {
+        (200, answer(&json!({"goalRelevant":true,"experiences":[{
+            "intent":"读取脚本配置", "summary":"从已定位的目标读取当前配置，后续按本次路径与内容核对。",
+            "keywords":["脚本","配置"], "conditions":["配置文件已定位"],
+            "steps":[{"tool":"workspace.read","action":"读取当前配置","inputRoles":{"path":"本次定位的文件"}}],
+            "verification":["确认返回当前内容"], "pitfalls":["配置写入尚未核对，不能声称修改成功"], "anchors":[]
+        }]}).to_string()))
+    });
+    let supervisor = supervisor(&fixture);
+    let mut run = supervisor
+        .journal
+        .create("配置脚本", "one-observation", "one", 600, None)
+        .unwrap();
+    let mut call = message(Role::Assistant, "");
+    call.tool_calls.push(ToolCall {
+        id: "fact".into(),
+        name: "workspace.read".into(),
+        arguments: json!({"path":"current.json"}),
+    });
+    supervisor.journal.append_message(&run, &call).unwrap();
+    let mut result = message(
+        Role::Tool,
+        json!({"ok":true,"value":{"content":"current config"}}).to_string(),
+    );
+    result.tool_call_id = Some("fact".into());
+    supervisor.journal.append_message(&run, &result).unwrap();
+    admit_memory_learning(&supervisor, &run, &["fact"]);
+    supervisor
+        .journal
+        .finish(&mut run, RunState::NeedsReview)
+        .unwrap();
+    supervisor.enqueue_experience_learning(&run).unwrap();
+    assert_eq!(supervisor.memory.pending().unwrap(), Some(run.id.clone()));
+    let learned = supervisor
+        .learn_experience(
+            &run.id,
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(learned.0, 1);
+    let memories = supervisor.recall_memories("读取脚本配置").unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].experience.steps.len(), 1);
+    assert!(!memories[0].experience.summary.is_empty());
+    assert_ne!(memories[0].validation_state, "verified");
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+    supervisor.shutdown();
+}
+
+#[test]
+fn initial_builtin_tools_are_lightweight_and_expand_with_provider_evidence() {
+    use crate::extension::{FunctionTool, ToolExposure};
+    let fixture = ModelFixture::new(|_| (200, answer("unused")));
+    let supervisor = supervisor(&fixture);
+    let mut registry = ToolRegistry::default();
+    workspace::register_tools(
+        &mut registry,
+        Arc::new(workspace::Workspace::from_config(
+            &crate::test_root("tools").join("user/config.json"),
+            None,
+        )),
+    )
+    .unwrap();
+    crate::bridge::register_tools(
+        &mut registry,
+        Arc::new(crate::bridge::BgiClient::new(
+            supervisor.config.read().unwrap().bridge.clone(),
+        )),
+    )
+    .unwrap();
+    {
+        let name = "plugins.list";
+        registry
+            .register(
+                FunctionTool::new(
+                    name,
+                    "read",
+                    json!({"type":"object"}),
+                    "core:skills",
+                    |_| Ok(json!({})),
+                )
+                .with_execution(ToolExecution {
+                    always_load: true,
+                    deferred: false,
+                    exposure: ToolExposure::Always,
+                    ..ToolExecution::read_only()
+                }),
+            )
+            .unwrap();
+    }
+    supervisor.extensions.write().unwrap().tools = Arc::new(registry);
+    let definitions = supervisor.definitions(&HashSet::new());
+    assert_eq!(definitions.len(), 56);
+    let policy = tool_policy::TurnTools::new(
+        &definitions,
+        &[],
+        &HashSet::new(),
+        operation::permissions::PermissionMode::AskEach,
+        false,
+    );
+    assert_eq!(policy.select(&definitions).len(), 4);
+    assert!(
+        !policy
+            .select(&definitions)
+            .iter()
+            .any(|tool| tool.name == "search.batch")
+    );
+    assert!(
+        policy
+            .select(&definitions)
+            .iter()
+            .any(|tool| tool.name == "tools.search")
+    );
+    assert!(
+        !policy
+            .select(&definitions)
+            .iter()
+            .any(|tool| tool.name.starts_with("memory."))
+    );
+    let alias = definitions
+        .iter()
+        .find(|tool| tool.name == "task.save")
+        .unwrap();
+    assert_eq!(alias.execution.effect, ToolEffect::LocalWrite);
+    let readonly = tool_policy::TurnTools::new(
+        &definitions,
+        &[],
+        &HashSet::from(["task.save".into()]),
+        operation::permissions::PermissionMode::PlanOnly,
+        false,
+    );
+    assert!(!readonly.allows(alias));
+    let mut call = message(Role::Assistant, "");
+    call.tool_calls.push(ToolCall {
+        id: "read".into(),
+        name: "bgi.user.read".into(),
+        arguments: json!({}),
+    });
+    let mut reply = message(
+        Role::Tool,
+        json!({"ok":true,"value":{"path":"group","sha256":"version"}}).to_string(),
+    );
+    reply.tool_call_id = Some("read".into());
+    let policy = tool_policy::TurnTools::new(
+        &definitions,
+        &[call, reply],
+        &HashSet::new(),
+        operation::permissions::PermissionMode::AskEach,
+        false,
+    );
+    let offered = policy.select(&definitions);
+    assert!(offered.iter().any(|tool| tool.name == "bgi.api.invoke"));
+    assert!(!offered.iter().any(|tool| tool.name == "workspace.write"));
+    assert!(!offered.iter().any(|tool| tool.name == "bgi.job.get"));
+}
+
+#[tokio::test]
+async fn discovered_builtin_shell_becomes_callable_without_loading_a_plugin() {
+    let mut turn = 0;
+    let fixture = ModelFixture::with_empty_memory_review(move |_request| {
+        turn += 1;
+        (
+            200,
+            match turn {
+                1 => tool_calls(vec![("tools.search", json!({"query":"workspace.shell"}))]),
+                2 => tool_calls(vec![(
+                    "workspace.shell",
+                    json!({"command":"Write-Output POLICY_SHELL","timeoutMs":10000}),
+                )]),
+                _ => answer("done"),
+            },
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let mut run = supervisor
+        .submit("执行指定命令", None, "shell", Some(30), None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = fixture.task_requests();
+    assert!(
+        !requests[0]["tools"]
+            .to_string()
+            .contains(&gateway::wire_name("workspace.shell"))
+    );
+    assert!(
+        requests[1]["tools"]
+            .to_string()
+            .contains(&gateway::wire_name("workspace.shell"))
+    );
+    let result = requests.last().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["ok"], true);
+    assert!(result["value"].to_string().contains("POLICY_SHELL"));
+}
+
+#[tokio::test]
+async fn large_read_keeps_version_evidence_and_artifact_pages_do_not_rewrap() {
+    let root = crate::test_root("artifact-page");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("large.txt");
+    std::fs::write(&file, "x".repeat(50_000)).unwrap();
+    let path = file.to_string_lossy().into_owned();
+    let mut turn = 0;
+    let fixture = ModelFixture::new(move |request| {
+        turn += 1;
+        (
+            200,
+            match turn {
+                1 => tool_calls(vec![(
+                    "workspace.read",
+                    json!({"path":path,"maxChars":50000}),
+                )]),
+                2 => {
+                    let message = request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|m| m["role"] == "tool")
+                        .unwrap();
+                    let result: Value =
+                        serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+                    assert_eq!(result["ok"], true);
+                    assert_eq!(result["value"]["sha256"].as_str().unwrap().len(), 64);
+                    assert_eq!(result["truncated"], true);
+                    tool_calls(vec![(
+                        "artifact.read",
+                        json!({"id":result["artifactId"],"offset":4000,"maxChars":1000}),
+                    )])
+                }
+                _ => answer("done"),
+            },
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let mut run = supervisor
+        .submit("读取大文件", None, "artifact", Some(30), None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = fixture.requests.lock().unwrap();
+    let result = requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    assert!(result["artifactId"].is_null());
+    assert_eq!(result["value"]["nextOffset"], 5000);
+    assert_eq!(
+        result["value"]["content"].as_str().unwrap().chars().count(),
+        1000
+    );
+}
+
+#[tokio::test]
+async fn compaction_preserves_current_user_authority_after_summarizing_its_message() {
+    let fixture = ModelFixture::with_empty_memory_review(|request| {
+        (
+            200,
+            if request["messages"][0]["content"] == CONTEXT_COMPACTION_PROMPT {
+                answer("压缩后的事实摘要")
+            } else {
+                answer("done")
+            },
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    let goal = "当前用户授权原文，不能用摘要替代";
+    let mut run = supervisor
+        .submit(goal, None, "current-goal", Some(30), None)
+        .unwrap();
+    let mut call = message(Role::Assistant, "");
+    call.tool_calls.push(ToolCall {
+        id: "large".into(),
+        name: "workspace.write".into(),
+        arguments: json!({}),
+    });
+    supervisor.journal.append_message(&run, &call).unwrap();
+    let mut reply = message(
+        Role::Tool,
+        json!({"ok":true,"value":{"proof":"证据".repeat(20_000)}}).to_string(),
+    );
+    reply.tool_call_id = Some("large".into());
+    supervisor.journal.append_message(&run, &reply).unwrap();
+    supervisor
+        .journal
+        .append_message(
+            &run,
+            &message(Role::User, "从截断处继续，不重复已经输出的内容"),
+        )
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = fixture.task_requests();
+    assert!(
+        requests.last().unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == goal)
+    );
+    assert!(run.context_compacted);
+}
+
+#[tokio::test]
+async fn parallel_limit_pairs_every_requested_tool() {
+    let root = crate::test_root("parallel-pairing");
+    std::fs::create_dir_all(&root).unwrap();
+    let files = (0..3)
+        .map(|index| {
+            let path = root.join(format!("{index}.txt"));
+            std::fs::write(&path, format!("VALUE-{index}")).unwrap();
+            path.to_string_lossy().into_owned()
+        })
+        .collect::<Vec<_>>();
+    let mut turn = 0;
+    let fixture = ModelFixture::new(move |_| {
+        turn += 1;
+        (
+            200,
+            if turn == 1 {
+                tool_calls(
+                    files
+                        .iter()
+                        .map(|path| ("workspace.read", json!({"path":path})))
+                        .collect(),
+                )
+            } else {
+                answer("done")
+            },
+        )
+    });
+    let supervisor = supervisor(&fixture);
+    supervisor
+        .config
+        .write()
+        .unwrap()
+        .agent
+        .max_tool_calls_per_turn = 2;
+    let mut run = supervisor
+        .submit("读取三个文件", None, "pairing", Some(30), None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = fixture.requests.lock().unwrap();
+    let results = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 3);
+    assert!(results[0]["content"].as_str().unwrap().contains("VALUE-0"));
+    assert!(results[1]["content"].as_str().unwrap().contains("VALUE-1"));
+    assert!(results[2]["content"].as_str().unwrap().contains("未执行"));
+    assert_eq!(run.tool_calls, 2);
+}
+
+#[tokio::test]
+async fn execution_policy_blocks_unread_write_then_allows_read_modify_verify() {
+    let root = crate::test_root("read-modify-verify");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("settings.txt");
+    std::fs::write(&path, "before").unwrap();
+    let file = path.to_string_lossy().into_owned();
+    let mut turn = 0;
+    let fixture = ModelFixture::new(move |request| {
+        turn += 1;
+        let body = match turn {
+            1 => {
+                assert!(
+                    !request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["function"]["name"]
+                            == gateway::wire_name("workspace.write"))
+                );
+                tool_calls(vec![(
+                    "workspace.write",
+                    json!({"path":file,"content":"wrong"}),
+                )])
+            }
+            2 => {
+                let result = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "tool")
+                    .unwrap();
+                let result: Value =
+                    serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+                assert_eq!(result["ok"], false);
+                tool_calls(vec![("workspace.read", json!({"path":file}))])
+            }
+            3 => {
+                let result = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "tool")
+                    .unwrap();
+                let result: Value =
+                    serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+                assert_eq!(result["value"]["text"], "before");
+                tool_calls(vec![(
+                    "workspace.write",
+                    json!({"path":file,"content":"after",
+                    "expectedSha256":result["value"]["sha256"]}),
+                )])
+            }
+            4 => tool_calls(vec![("workspace.read", json!({"path":file}))]),
+            _ => answer("verified"),
+        };
+        (200, body)
+    });
+    let supervisor = supervisor(&fixture);
+    let mut run = supervisor
+        .submit("修改设置并核验", None, "modify", Some(30), None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "after");
+    let requests = fixture.requests.lock().unwrap();
+    assert!(
+        requests.last().unwrap()["messages"]
+            .to_string()
+            .contains("after")
+    );
+}
+
+#[tokio::test]
+async fn oversized_tool_history_is_compacted_without_losing_input_or_pairing() {
+    let mut rejected_summary = false;
+    let fixture =
+        ModelFixture::new(move |request| {
+            let summarizing = request["messages"][0]["content"] == CONTEXT_COMPACTION_PROMPT;
+            if summarizing {
+                assert!(request["tools"].as_array().unwrap().is_empty());
+                assert!(request["messages"].as_array().unwrap().iter().all(|message|
+                message["role"] != "tool" && message["tool_calls"].is_null()));
+                let data = request["messages"][2]["content"].as_str().unwrap();
+                if data.chars().count() > 2000 && !rejected_summary {
+                    rejected_summary = true;
+                    return (400, json!({"error":{"message":"context length exceeded"}}));
+                }
+                let previous = request["messages"][1]["content"].as_str().unwrap();
+                let mut summary = "目标：保留原始操作事实。已确认：".to_owned();
+                for marker in ["FIRST_MARKER", "LAST_MARKER"] {
+                    if data.contains(marker) || previous.contains(marker) {
+                        summary.push_str(marker);
+                    }
+                }
+                return (200, answer(&summary));
+            }
+            (200, answer("continued"))
+        });
+    let supervisor = supervisor(&fixture);
+    let mut old = supervisor
+        .submit("旧目标", Some("compact"), "old", Some(30), None)
+        .unwrap();
+    let mut call = message(Role::Assistant, "");
+    call.tool_calls.push(ToolCall {
+        id: "old-write".into(),
+        name: "workspace.write".into(),
+        arguments: json!({"path":"old"}),
+    });
+    supervisor.journal.append_message(&old, &call).unwrap();
+    let mut result = message(
+        Role::Tool,
+        json!({"ok":true,"value":{
+            "evidence":format!("FIRST_MARKER{}LAST_MARKER", "旧证据".repeat(12_000))
+        }})
+        .to_string(),
+    );
+    result.tool_call_id = Some("old-write".into());
+    supervisor.journal.append_message(&old, &result).unwrap();
+    supervisor
+        .journal
+        .save(&mut old, RunState::Succeeded)
+        .unwrap();
+    let mut run = supervisor
+        .submit(
+            "当前目标原文必须保留",
+            Some("compact"),
+            "new",
+            Some(30),
+            None,
+        )
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(run.result.as_deref(), Some("continued"));
+    let requests = fixture.requests.lock().unwrap();
+    assert!(requests.len() > 3);
+    let final_request = requests.last().unwrap();
+    assert!(
+        final_request["messages"]
+            .to_string()
+            .contains("当前目标原文必须保留")
+    );
+    assert!(
+        final_request["messages"]
+            .to_string()
+            .contains("FIRST_MARKER")
+    );
+    assert!(
+        final_request["messages"]
+            .to_string()
+            .contains("LAST_MARKER")
+    );
+    assert!(
+        supervisor
+            .journal
+            .conversation_messages("compact")
+            .unwrap()
+            .iter()
+            .any(|message| message.message.content.contains("LAST_MARKER"))
+    );
+}
+
+#[tokio::test]
+async fn server_context_overflow_forces_summary_even_when_estimate_fits() {
+    let mut rejected = false;
+    let fixture = ModelFixture::new(move |request| {
+        if request["messages"][0]["content"] == CONTEXT_COMPACTION_PROMPT {
+            return (200, answer("已确认旧目标与旧结果；继续当前目标。"));
+        }
+        if !rejected {
+            rejected = true;
+            return (400, json!({"error":{"message":"context length exceeded"}}));
+        }
+        (200, answer("recovered"))
+    });
+    let supervisor = supervisor(&fixture);
+    let mut old = supervisor
+        .submit("旧目标", Some("overflow"), "old", Some(30), None)
+        .unwrap();
+    supervisor
+        .journal
+        .append_message(&old, &message(Role::Assistant, "旧结果"))
+        .unwrap();
+    supervisor
+        .journal
+        .save(&mut old, RunState::Answered)
+        .unwrap();
+    let mut run = supervisor
+        .submit("当前目标", Some("overflow"), "new", Some(30), None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(run.result.as_deref(), Some("recovered"));
+    assert!(run.context_compacted);
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["messages"][0]["content"] == CONTEXT_COMPACTION_PROMPT)
+    );
+}
+
+#[tokio::test]
+async fn truncated_summary_is_retried_and_never_committed_as_complete() {
+    let mut rejected = false;
+    let mut summary_attempts = 0;
+    let fixture = ModelFixture::new(move |request| {
+        if request["messages"][0]["content"] == CONTEXT_COMPACTION_PROMPT {
+            summary_attempts += 1;
+            if summary_attempts == 1 {
+                let mut response = answer("PARTIAL_SUMMARY");
+                response["choices"][0]["finish_reason"] = json!("length");
+                return (200, response);
+            }
+            return (200, answer("COMPLETE_SUMMARY"));
+        }
+        if !rejected {
+            rejected = true;
+            return (400, json!({"error":{"message":"context_window_exceeded"}}));
+        }
+        (200, answer("continued"))
+    });
+    let supervisor = supervisor(&fixture);
+    let mut old = supervisor
+        .submit("old", Some("truncated"), "old", Some(30), None)
+        .unwrap();
+    supervisor
+        .journal
+        .append_message(&old, &message(Role::Assistant, "old answer"))
+        .unwrap();
+    supervisor
+        .journal
+        .save(&mut old, RunState::Answered)
+        .unwrap();
+    let mut run = supervisor
+        .submit("new", Some("truncated"), "new", Some(30), None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    let (summary, _) = supervisor.journal.history_window(&run).unwrap();
+    let summary = summary.unwrap().content;
+    assert!(summary.contains("COMPLETE_SUMMARY"));
+    assert!(!summary.contains("PARTIAL_SUMMARY"));
+    let event = supervisor
+        .journal
+        .events(&run.conversation_id, 0)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "context.compacted" && event.data["mode"] == "summary")
+        .unwrap();
+    assert!(event.data["outputTokens"].as_u64().unwrap() >= 60);
+    let summary_requests = fixture
+        .task_requests()
+        .into_iter()
+        .filter(|request| request["messages"][0]["content"] == CONTEXT_COMPACTION_PROMPT)
+        .collect::<Vec<_>>();
+    assert!(
+        summary_requests[1]["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .len()
+            < summary_requests[0]["messages"][2]["content"]
+                .as_str()
+                .unwrap()
+                .len(),
+        "truncated input must be refined, not replayed unchanged"
+    );
+    assert_eq!(run.result.as_deref(), Some("continued"));
+}
+
+#[tokio::test]
+async fn exhausted_reasoning_adapts_only_unconfigured_output_and_keeps_model() {
+    let fixture = ModelFixture::new(|request| {
+        let limit = request["max_tokens"].as_u64().unwrap();
+        if limit <= 8192 {
+            (
+                200,
+                json!({"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"private reasoning"},"finish_reason":"length"}],"usage":{"prompt_tokens":100,"completion_tokens":limit}}),
+            )
+        } else {
+            (200, answer("完整结果"))
+        }
+    });
+    let supervisor = supervisor(&fixture);
+    {
+        let mut config = supervisor.config.write().unwrap();
+        config.models[0].options.max_output_tokens = None;
+        config.models[0].options.context_window = 1048576;
+    }
+    let mut run = supervisor
+        .submit("核对后回答", None, "adaptive-output", Some(30), None)
+        .unwrap();
+    supervisor
+        .session(&mut run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(run.result.as_deref(), Some("完整结果"));
+    let requests = fixture.task_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["model"], requests[1]["model"]);
+    assert!(
+        requests[1]["max_tokens"].as_u64().unwrap() > requests[0]["max_tokens"].as_u64().unwrap()
+    );
+    assert!(
+        supervisor.config.read().unwrap().models[0]
+            .options
+            .max_output_tokens
+            .is_none()
+    );
+}
+
+#[path = "harness-optimization.rs"]
+mod harness_optimization;
+
+#[path = "structured-decisions.rs"]
+mod structured_decisions;
+
+#[path = "lightweight-entry.rs"]
+mod lightweight_entry;
+
+#[path = "progressive-skills.rs"]
+mod progressive_skills;
+
+#[path = "skill-efficiency.rs"]
+mod skill_efficiency;
+
+#[path = "search-batch.rs"]
+mod search_batch_tests;
+
+#[path = "search-batch-live.rs"]
+mod search_batch_live;
+
+#[path = "local-adapters-live.rs"]
+mod local_adapters_live;

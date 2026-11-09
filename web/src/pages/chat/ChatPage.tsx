@@ -1,0 +1,880 @@
+import { Button } from "@pudding/ui";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import mascot from "../../brand/mascot.webp";
+import "./ChatPage.css";
+import { Transcript } from "../../components/chat/Transcript";
+import { api } from "../../ipc/api";
+import {
+  HelpIcon,
+  SendIcon,
+  SettingsIcon,
+  StopIcon,
+} from "@pudding/ui/icons";
+import {
+  SkillMenu,
+  filterSkills,
+  manualSkills,
+  skillCommandName,
+} from "../../components/chat/SkillMenu";
+import { Select } from "@pudding/ui/controls/Select";
+import {
+  isRunning,
+  phaseLabel,
+  readError,
+  session,
+  taskLabels,
+  useSession,
+} from "../../session";
+import { Toast } from "@pudding/ui/overlay/Toast";
+import type {
+  Bootstrap,
+  QuestionAnswers,
+  QuestionRequestInfo,
+  RunApproval,
+} from "../../ipc/types";
+import { MotionSwitch } from "@pudding/ui/controls/MotionSwitch";
+import { DisclosureChevron } from "@pudding/ui/controls/DisclosureChevron";
+import { resolveConversationModel } from "../../models";
+import { ContextMeter } from "../../components/chat/ContextMeter";
+import { ComposerDeck } from "@pudding/ui/chat/ComposerDeck";
+import { ComposerField } from "@pudding/ui/chat/ComposerField";
+import { PendingRequestLayer } from "../../components/chat/QuestionCard";
+import { useT } from "../../i18n";
+import type { Plan } from "../../session";
+import { DEFAULT_CONTEXT_WINDOW } from "../../models/presets";
+import { useConversationScroll } from "../../components/chat/useConversationScroll";
+
+interface Props {
+  bootstrap: Bootstrap;
+  conversationId?: string | undefined;
+  onConversation(id: string): void;
+  reload(): Promise<void>;
+  onComposerDraft?(active: boolean): void;
+  onOpenModels?(): void;
+}
+
+export function RunPlanCard({ plan }: { plan: Plan }) {
+  const [expanded, setExpanded] = useState(false);
+  const t = useT();
+  return (
+    <section className="run-plan-cluster" data-expanded={expanded}>
+      <div className="run-plan">
+        <button
+          type="button"
+          className="run-plan-summary"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((open) => !open)}
+        >
+          <span>{t.chat.planSummary(plan.steps.length)}</span>
+          <DisclosureChevron expanded={expanded} />
+        </button>
+        <div
+          className="run-plan-motion"
+          aria-hidden={!expanded}
+          inert={!expanded}
+        >
+          <div className="run-plan-motion-inner">
+            <ol>
+              {plan.steps.map((step) => (
+                <li key={step.id}>
+                  {step.title}
+                  {step.outcome && (
+                    <span className="muted">
+                      {" "}
+                      ·{" "}
+                      {step.outcome === "active"
+                        ? t.chat.statusRunning
+                        : step.outcome === "verifiedSucceeded"
+                          ? t.chat.statusDone
+                          : step.outcome}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ol>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// 从光标往回找 `/查询词` 的起点；`/` 必须在文本空白分界之后，
+// token 里再出现别的 `/`（URL、路径）就不算命令，返回 -1。
+function slashTokenStart(value: string, caret: number): number {
+  for (let i = Math.min(caret, value.length) - 1; i >= 0; i -= 1) {
+    const char = value.charAt(i);
+    if (char === "/") {
+      if (i === 0 || /\s/.test(value.charAt(i - 1))) return i;
+      return -1;
+    }
+    if (/\s/.test(char)) return -1;
+  }
+  return -1;
+}
+
+export function ChatPage({
+  bootstrap,
+  conversationId,
+  onConversation,
+  reload,
+  onComposerDraft,
+  onOpenModels,
+}: Props) {
+  const t = useT();
+  const data = useSession(conversationId);
+  const {
+    messages,
+    task,
+    stream,
+    contextActivities,
+    contextUsage,
+    question,
+    questionRequests,
+    approval,
+    plan,
+    loading,
+  } = data;
+  const busy = isRunning(task);
+  const draftKey = `pudding-draft:${conversationId ?? "new"}`;
+  const [prompt, setPrompt] = useState(
+    () => localStorage.getItem(draftKey) ?? "",
+  );
+  const [promptKey, setPromptKey] = useState(draftKey);
+  if (promptKey !== draftKey) {
+    setPromptKey(draftKey);
+    setPrompt(localStorage.getItem(draftKey) ?? "");
+  }
+  const [unread, setUnread] = useState(false);
+  const [sending, setSending] = useState(false);
+  const submissionEpoch = useRef(0);
+  const inputId = useId();
+  const [stopping, setStopping] = useState(false);
+  const interrupting = stopping || task?.state === "cancelling";
+  // 工具名取自工具定义里的 label，没有 label 的不进表。
+  const toolLabels = useMemo(
+    () => ({
+      ...bootstrap.runtimeToolLabels,
+      ...Object.fromEntries(
+        bootstrap.tools
+          .filter((tool) => tool.label)
+          .map((tool) => [tool.name, tool.label] as const),
+      ),
+    }),
+    [bootstrap.tools, bootstrap.runtimeToolLabels],
+  );
+  const [error, setError] = useState("");
+  const [now, setNow] = useState(Date.now());
+  const [pendingModel, setPendingModel] = useState<string | null>(null);
+  const conversation = bootstrap.conversations.find(
+    (entry) => entry.id === conversationId,
+  );
+  const selectedModel = resolveConversationModel(
+    bootstrap.models,
+    conversation,
+    pendingModel,
+  );
+  const contextWindow =
+    (busy ? contextUsage?.window : undefined) ||
+    bootstrap.models.find((entry) => entry.id === selectedModel)
+      ?.contextWindow ||
+    DEFAULT_CONTEXT_WINDOW;
+  const contextUsed = contextUsage?.used ?? (conversationId ? undefined : 0);
+  const current = useRef(conversationId);
+  current.current = conversationId;
+  const alive = useRef(true);
+  const scroll = useRef<HTMLDivElement>(null);
+  const flow = useRef<HTMLDivElement>(null);
+  const dock = useRef<HTMLDivElement>(null);
+  const workspace = useRef<HTMLElement>(null);
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  const follow = useRef(true);
+  const returnToLatest = useConversationScroll(
+    draftKey,
+    loading,
+    scroll,
+    flow,
+    dock,
+    follow,
+    setUnread,
+  );
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  useLayoutEffect(() => {
+    submissionEpoch.current += 1;
+    setError("");
+    setSending(false);
+    setPendingModel(null);
+    follow.current = true;
+  }, [draftKey]);
+  useEffect(() => {
+    onComposerDraft?.(!conversationId && prompt.trim().length > 0);
+  }, [conversationId, prompt, onComposerDraft]);
+  useEffect(() => {
+    return () => onComposerDraft?.(false);
+  }, [onComposerDraft]);
+  useEffect(() => {
+    setStopping(false);
+  }, [task?.id, busy]);
+  useEffect(() => {
+    if (!busy && !approval && !questionRequests.length) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [busy, approval, questionRequests]);
+  const setDraft = (value: string) => {
+    setPrompt(value);
+    localStorage.setItem(draftKey, value);
+  };
+  const invocableSkills = useMemo(
+    () => manualSkills(bootstrap.skills),
+    [bootstrap.skills],
+  );
+  // `/` 菜单：start 是输入框里 `/` 的下标，query 是 `/` 到光标之间的筛选词。
+  const [slash, setSlash] = useState<{
+    start: number;
+    query: string;
+    index: number;
+  } | null>(null);
+  useEffect(() => {
+    setSlash(null);
+  }, [draftKey]);
+  const updateSlash = (value: string, caret: number) => {
+    if (!invocableSkills.length) {
+      setSlash(null);
+      return;
+    }
+    const start = slashTokenStart(value, caret);
+    if (start < 0) {
+      setSlash(null);
+      return;
+    }
+    const query = value.slice(start + 1, caret);
+    // 同一段 token 的同词不重置高亮；只有 token 或查询词变了才回到第一项。
+    setSlash((prev) =>
+      prev && prev.start === start && prev.query === query
+        ? prev
+        : { start, query, index: 0 },
+    );
+  };
+  // 技能菜单把 `$技能名` 插到光标处；运行时按这个前缀显式装载该技能。
+  const commandName = (name: string) => {
+    const skill = invocableSkills.find((skill) => skill.name === name);
+    return skill ? skillCommandName(skill) : name;
+  };
+  const insertSkill = (name: string) => {
+    const marker = `$${commandName(name)} `;
+    const node = textarea.current;
+    if (!node) {
+      setDraft(marker + prompt);
+      return;
+    }
+    const at = node.selectionStart ?? prompt.length;
+    // 光标停在还没关掉的 `/查询词` 上时，+ 按钮选同一技能也走替换，别留下 "/$"。
+    const token = slashTokenStart(prompt, at);
+    if (token >= 0) {
+      const query = prompt.slice(token + 1, at);
+      if (
+        filterSkills(invocableSkills, query).some(
+          (skill) => skill.name === name,
+        )
+      ) {
+        const caret = token + marker.length;
+        setDraft(prompt.slice(0, token) + marker + prompt.slice(at));
+        requestAnimationFrame(() => {
+          node.focus();
+          node.setSelectionRange(caret, caret);
+        });
+        return;
+      }
+    }
+    const insertion =
+      at > 0 && !/\s/u.test(prompt[at - 1]!) ? ` ${marker}` : marker;
+    setDraft(prompt.slice(0, at) + insertion + prompt.slice(at));
+    requestAnimationFrame(() => {
+      node.focus();
+      const caret = at + insertion.length;
+      node.setSelectionRange(caret, caret);
+    });
+  };
+  // slash 菜单选中：只替换 `/查询词` 这一段，前后文字与光标位置都保留。
+  const applySlashPick = (name: string) => {
+    if (!slash) return;
+    const node = textarea.current;
+    const caret = node?.selectionStart ?? prompt.length;
+    const marker = `$${commandName(name)} `;
+    const at = slash.start;
+    setSlash(null);
+    setDraft(prompt.slice(0, at) + marker + prompt.slice(caret));
+    requestAnimationFrame(() => {
+      node?.focus();
+      node?.setSelectionRange(at + marker.length, at + marker.length);
+    });
+  };
+  // 发送即发起新请求：本轮仍在运行时由后端打断后接续，不排队；
+  // sending 只作防双击的事务守卫，不阻止编辑草稿或打开 + 菜单。
+  const send = async () => {
+    const value = prompt.trim();
+    if (!value || sending || !bootstrap.models.length) return;
+    const origin = conversationId;
+    const epoch = ++submissionEpoch.current;
+    const retryKey = `${draftKey}:pending`;
+    let pending: { key: string; prompt: string } | undefined;
+    try {
+      pending =
+        JSON.parse(sessionStorage.getItem(retryKey) ?? "null") ?? undefined;
+    } catch {
+      /* 存的内容不是合法 JSON。 */
+    }
+    const clientKey =
+      pending?.prompt === value ? pending.key : crypto.randomUUID();
+    sessionStorage.setItem(
+      retryKey,
+      JSON.stringify({ key: clientKey, prompt: value }),
+    );
+    setSending(true);
+    setSlash(null);
+    follow.current = true;
+    setError("");
+    setDraft("");
+    try {
+      const run = await api.submitTask(
+        value,
+        origin,
+        clientKey,
+        origin ? undefined : selectedModel,
+        true,
+      );
+      session(run.conversationId).start();
+      if (
+        alive.current &&
+        current.current === origin &&
+        submissionEpoch.current === epoch
+      ) {
+        // 新对话首次 ACK 后切到新会话，draftKey 会从 new 键变成会话键；
+        // 切换前把用户在等待期间写下的最新草稿（不是已发送的那条）迁移
+        // 过去，否则切换读新键会拿到空、草稿丢失。用户已切到其它对话
+        // （current !== origin）时不迁移不覆盖；已存在会话不受影响。
+        if (!origin) {
+          const latest = localStorage.getItem(draftKey) ?? "";
+          if (latest !== "") {
+            localStorage.setItem(
+              `pudding-draft:${run.conversationId}`,
+              latest,
+            );
+            // 迁移完成清掉 new 键，同一段草稿不在下次新建对话时重现。
+            localStorage.removeItem(draftKey);
+          }
+        }
+        onConversation(run.conversationId);
+      }
+      sessionStorage.removeItem(retryKey);
+      // The server has accepted this prompt. A shell refresh failure must not
+      // restore the draft and invite the same message to be sent a second time.
+      void reload().catch((reason: unknown) => {
+        if (
+          alive.current &&
+          current.current === origin &&
+          submissionEpoch.current === epoch
+        )
+          setError(readError(reason));
+      });
+    } catch (reason) {
+      // 提交失败要放回草稿，但期间用户已写的新草稿绝不能被旧提交文本
+      // 覆盖；只在本会话仍是发起会话、且草稿仍为空（未编辑过）时恢复。
+      if (
+        alive.current &&
+        current.current === origin &&
+        submissionEpoch.current === epoch
+      ) {
+        setPrompt((prev) => {
+          if (prev !== "") return prev;
+          localStorage.setItem(draftKey, value);
+          return value;
+        });
+        setError(readError(reason));
+      }
+    } finally {
+      if (
+        alive.current &&
+        current.current === origin &&
+        submissionEpoch.current === epoch
+      )
+        setSending(false);
+    }
+  };
+  const act = async (action: () => Promise<unknown>) => {
+    setError("");
+    try {
+      await action();
+      await reload();
+    } catch (reason) {
+      setError(readError(reason));
+    }
+  };
+  const welcome = !conversationId && !messages.length;
+  const elapsed = task
+    ? Math.max(0, Math.floor((now - new Date(task.createdAt).getTime()) / 1000))
+    : 0;
+  const phase = interrupting
+    ? "正在停止"
+    : question || questionRequests.length || approval
+      ? undefined
+      : phaseLabel(task);
+  // 等待用户作答/确认：输入框仍可编辑、发送即打断；这里只说明在等什么，
+  // 取消入口可用，文案换成「取消任务」。
+  const waitingForUser = Boolean(
+    question || questionRequests.length || approval,
+  );
+  // 问答按真实剩余空间伸展，保留输入框和至少 112px 历史；不再固定卡死 320px。
+  // 仅观察工作区/输入框高度，避免问答面板自身尺寸反馈造成抖动。
+  useLayoutEffect(() => {
+    const ws = workspace.current;
+    const dk = dock.current;
+    if (!ws || !dk || !waitingForUser) return;
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      const wsH = ws.getBoundingClientRect().height;
+      const dkH = dk.getBoundingClientRect().height;
+      const waitH =
+        ws.querySelector(".composer-waiting")?.getBoundingClientRect().height ??
+        0;
+      const requestDock = ws.querySelector(".pending-request-dock");
+      const requestPad = requestDock
+        ? parseFloat(getComputedStyle(requestDock).paddingTop) || 0
+        : 0;
+      const available = wsH - dkH - waitH - requestPad;
+      const historyReserve = Math.min(
+        160,
+        Math.max(112, Math.floor(wsH * 0.18)),
+        Math.max(48, available - 260),
+      );
+      const max = Math.max(0, Math.floor(available - historyReserve));
+      if (
+        ws.style.getPropertyValue("--pending-request-max-height") !== `${max}px`
+      )
+        ws.style.setProperty("--pending-request-max-height", `${max}px`);
+    };
+    update();
+    const observer = new ResizeObserver(() => {
+      if (!frame) frame = requestAnimationFrame(update);
+    });
+    observer.observe(ws);
+    observer.observe(dk);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+      ws.style.removeProperty("--pending-request-max-height");
+    };
+  }, [waitingForUser]);
+  // 结构化答复走专用 RPC；旧事件（无 journal 记录）保持 run.input 兼容。
+  const answerQuestion = async (
+    request: QuestionRequestInfo,
+    answers: QuestionAnswers,
+    clientKey: string,
+  ) => {
+    const origin = conversationId;
+    if (request.legacy) {
+      const text = answers.answer?.answers[0] ?? "";
+      if (!text) throw new Error(t.chat.writeReply);
+      await api.supplement(request.runId, text, clientKey);
+    } else {
+      await api.answerQuestion(
+        request.runId,
+        request.requestId,
+        answers,
+        clientKey,
+      );
+    }
+    // ACK 成功：在发起答复的那个会话里立即终结该请求，迟到的事件/快照
+    // 都不能复活它；回调按 origin 归属，不写当前恰好打开的别的聊天。
+    if (origin)
+      session(origin).resolveQuestionRequest(request.runId, request.requestId);
+  };
+  const decideApproval = async (target: RunApproval, approved: boolean) => {
+    setError("");
+    try {
+      await api.approve(target.id, approved);
+      await reload();
+    } catch (reason) {
+      setError(readError(reason));
+    }
+  };
+  return (
+    <section
+      ref={workspace}
+      className={`chat-workspace${welcome ? " is-welcome" : ""}`}
+    >
+      <MotionSwitch
+        viewKey={conversationId ?? "new"}
+        className="chat-scene-switch"
+      >
+        <div ref={scroll} className="chat-scroll">
+          {welcome ? (
+            <div className="chat-welcome">
+              <img
+                className="welcome-mascot"
+                src={mascot}
+                alt={t.chat.mascotAlt}
+                draggable={false}
+                onDragStart={(event) => event.preventDefault()}
+              />
+              <h2>{t.chat.startNew}</h2>
+              {!bootstrap.models.length &&
+                (onOpenModels ? (
+                  <Button type="button" variant="subtle" onClick={onOpenModels}>
+                    <SettingsIcon className="button-icon" />
+                    {t.chat.addModelFirst}
+                  </Button>
+                ) : (
+                  <p className="muted">{t.chat.addModelFirst}</p>
+                ))}
+              <Button
+                type="button"
+                variant="subtle"
+                onClick={() =>
+                  window.dispatchEvent(
+                    new CustomEvent("pudding:open-release-notes", {
+                      detail: "guide",
+                    }),
+                  )
+                }
+              >
+                <HelpIcon className="button-icon" />
+                {t.account.help}
+              </Button>
+            </div>
+          ) : (
+            <div className="conversation-scene">
+              {loading && !messages.length && (
+                <p className="muted">{t.common.loading}</p>
+              )}
+              <div ref={flow} className="conversation-flow">
+                <Transcript
+                  messages={messages}
+                  stream={stream}
+                  phase={phase}
+                  seconds={elapsed}
+                  running={busy}
+                  waiting={
+                    waitingForUser
+                      ? approval
+                        ? t.chat.composerWaitingApproval
+                        : t.chat.composerWaitingQuestion
+                      : undefined
+                  }
+                  toolLabels={toolLabels}
+                  tasks={bootstrap.tasks}
+                  currentTask={task}
+                  contextActivities={contextActivities}
+                />
+                {plan && <RunPlanCard plan={plan} />}
+                {/* 取消与失败分别由对话记录标注。 */}
+                {task &&
+                  !busy &&
+                  ["failed", "partial", "blocked"].includes(task.state) && (
+                    <section className="run-error" role="status">
+                      <h3>{taskLabels[task.state]}</h3>
+                      <p>{task.error || task.result}</p>
+                      {task.state === "blocked" && (
+                        <div className="detail-actions">
+                          <Button
+                            variant="primary"
+                            onClick={() =>
+                              void act(() => api.resumeTask(task.id))
+                            }
+                          >
+                            重试任务
+                          </Button>
+                          <Button
+                            variant="secondary"
+                            onClick={() =>
+                              void act(() => api.cancelTask(task.id))
+                            }
+                          >
+                            停止任务
+                          </Button>
+                        </div>
+                      )}
+                    </section>
+                  )}
+              </div>
+            </div>
+          )}
+        </div>
+      </MotionSwitch>
+      {unread && (
+        <div className="chat-unread-anchor">
+          <button
+            className="chat-unread"
+            onClick={() => {
+              returnToLatest();
+            }}
+          >
+            有新内容 · 回到最新
+          </button>
+        </div>
+      )}
+      {/* 等待期间明示在等什么；ContextMeter（上下文用量）照常保留，不画 spinner。 */}
+      {waitingForUser && (
+        <p className="composer-waiting" role="status">
+          {approval
+            ? t.chat.composerWaitingApproval
+            : t.chat.composerWaitingQuestion}
+        </p>
+      )}
+      {/* 问答/审批独立 dock：与 composer 同宽，不覆盖历史与输入框。 */}
+      <div className="pending-request-dock">
+        <PendingRequestLayer
+          requests={questionRequests}
+          approval={approval}
+          now={now}
+          conversationId={conversationId}
+          onAnswer={answerQuestion}
+          onDecide={decideApproval}
+        />
+      </div>
+      <div className="composer-dock" ref={dock} data-waiting={waitingForUser}>
+        {(error || data.error) && (
+          <Toast
+            message={error || data.error}
+            // 连接断开是持续状态，提示不自动消失。
+            duration={data.error ? 0 : 4000}
+            onDismiss={() => setError("")}
+          />
+        )}
+        <ComposerDeck>
+          <ComposerField
+            id={inputId}
+            ref={textarea}
+            aria-label={t.chat.message}
+            // 任意运行/等待态都保持可编辑：草稿随时可写，发送会打断上一轮。
+            placeholder={t.chat.composerPlaceholderNew}
+            value={prompt}
+            highlightTerms={invocableSkills.flatMap((skill) => [
+              `$${skill.name}`,
+              `$${skillCommandName(skill)}`,
+            ])}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              const node = event.target;
+              updateSlash(node.value, node.selectionStart ?? node.value.length);
+            }}
+            onKeyDown={(event) => {
+              // IME 组合中的按键（含 keyCode 229）一律不拦截。
+              if (event.nativeEvent.isComposing || event.keyCode === 229)
+                return;
+              const modified =
+                localStorage.getItem("pudding-send-key") === "modifier";
+              // 菜单选择永远是纯 Enter；发送快捷键才跟随用户偏好。
+              const menuEnter =
+                event.key === "Enter" &&
+                !event.shiftKey &&
+                !event.ctrlKey &&
+                !event.metaKey &&
+                !event.altKey;
+              const plainEnter =
+                event.key === "Enter" &&
+                !event.shiftKey &&
+                (modified
+                  ? event.ctrlKey || event.metaKey
+                  : !event.ctrlKey && !event.metaKey);
+              if (slash) {
+                const items = filterSkills(invocableSkills, slash.query);
+                const index = items.length
+                  ? Math.min(slash.index, items.length - 1)
+                  : -1;
+                // 只有看得到匹配项时才截获方向键，普通移动不抢。
+                if (
+                  (event.key === "ArrowDown" || event.key === "ArrowUp") &&
+                  items.length
+                ) {
+                  event.preventDefault();
+                  const next =
+                    (index +
+                      (event.key === "ArrowDown" ? 1 : -1) +
+                      items.length) %
+                    items.length;
+                  setSlash({ ...slash, index: next });
+                  return;
+                }
+                // 光标移出这段 token 就收起，避免菜单挂在过期的查询词上。
+                if (
+                  event.key === "ArrowLeft" ||
+                  event.key === "ArrowRight" ||
+                  event.key === "Home" ||
+                  event.key === "End" ||
+                  event.key === "PageUp" ||
+                  event.key === "PageDown"
+                ) {
+                  setSlash(null);
+                  return;
+                }
+                if (event.key === "Escape") {
+                  setSlash(null);
+                  return;
+                }
+                if (menuEnter && items.length) {
+                  event.preventDefault();
+                  const choice = items[index];
+                  if (choice) applySlashPick(choice.name);
+                  return;
+                }
+              }
+              if (plainEnter) {
+                event.preventDefault();
+                void send();
+              }
+            }}
+            onSelect={(event) => {
+              const node = event.currentTarget;
+              if ((node.selectionStart ?? 0) !== (node.selectionEnd ?? 0)) {
+                setSlash(null);
+                return;
+              }
+              updateSlash(node.value, node.selectionStart ?? node.value.length);
+            }}
+          />
+          <div className="composer-actions">
+            <SkillMenu
+              skills={invocableSkills}
+              onPick={insertSkill}
+              slash={slash}
+              onSlashPick={applySlashPick}
+              onSlashClose={() => setSlash(null)}
+              anchorElement={textarea.current}
+            />
+            <div className="composer-menu composer-approval">
+              <Select
+                label={t.chat.approvalLevel}
+                value={bootstrap.permission.mode}
+                options={bootstrap.permission.levels.map((level) => ({
+                  value: level.value,
+                  label: level.label,
+                  description: level.description,
+                }))}
+                onChange={(mode) =>
+                  void act(async () => {
+                    await api.setPermission(mode);
+                  })
+                }
+              />
+            </div>
+            <div className="composer-submit">
+              <ContextMeter
+                used={contextUsed}
+                window={contextWindow}
+                cacheHit={contextUsage?.cacheHit ?? 0}
+              />
+              <div className="composer-menu composer-model">
+                <Select
+                  label={t.chat.model}
+                  value={selectedModel}
+                  disabled={sending || !bootstrap.models.length}
+                  options={bootstrap.models.map((model) => ({
+                    value: model.id,
+                    label: model.name,
+                    description: model.model,
+                  }))}
+                  footer={
+                    onOpenModels
+                      ? {
+                          label: t.chat.configureModels,
+                          onClick: () => onOpenModels(),
+                        }
+                      : undefined
+                  }
+                  onChange={(id) => {
+                    if (!conversationId) {
+                      setPendingModel(id);
+                      return;
+                    }
+                    void act(async () => {
+                      await api.setConversationModel(conversationId, id);
+                    });
+                  }}
+                />
+              </div>
+              {/* 运行中停止照常可用；写了新草稿就同时显示发送，发送即打断上一轮。 */}
+              {busy && (
+                <button
+                  type="button"
+                  className="send-action"
+                  aria-label={
+                    interrupting
+                      ? "正在停止"
+                      : waitingForUser
+                        ? t.chat.cancelTask
+                        : t.chat.stop
+                  }
+                  title={
+                    interrupting
+                      ? "正在停止"
+                      : waitingForUser
+                        ? t.chat.cancelTask
+                        : t.chat.stop
+                  }
+                  aria-busy={interrupting}
+                  disabled={interrupting}
+                  data-stopping={interrupting}
+                  onClick={() => {
+                    if (!task || stopping) return;
+                    setStopping(true);
+                    setError("");
+                    void api
+                      .cancelTask(task.id)
+                      .then(reload)
+                      .catch((reason: unknown) => {
+                        if (
+                          !alive.current ||
+                          current.current !== task.conversationId
+                        )
+                          return;
+                        setStopping(false);
+                        setError(readError(reason));
+                      });
+                  }}
+                >
+                  {interrupting ? (
+                    <span className="activity-spinner" aria-hidden="true" />
+                  ) : (
+                    <StopIcon className="button-icon" />
+                  )}
+                </button>
+              )}
+              {(!busy || prompt.trim()) && (
+                <button
+                  type="button"
+                  className="send-action"
+                  aria-label={t.chat.send}
+                  title={
+                    !bootstrap.models.length
+                      ? t.chat.addModelFirst
+                      : t.chat.send
+                  }
+                  disabled={
+                    sending || !prompt.trim() || !bootstrap.models.length
+                  }
+                  onClick={() => void send()}
+                >
+                  <SendIcon className="button-icon" />
+                </button>
+              )}
+            </div>
+          </div>
+        </ComposerDeck>
+      </div>
+    </section>
+  );
+}

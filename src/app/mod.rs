@@ -1,0 +1,1916 @@
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, RwLock},
+};
+
+use serde::Serialize;
+use serde_json::{Value, json};
+
+use crate::{
+    bridge::BgiClient,
+    config::{AppConfig, ModelAuth, ModelConfig, ModelOptions, ModelProtocol},
+    error::{Error, Result},
+    extension::plugins::PluginManager,
+    extension::skills::SkillRegistry,
+    extension::{FunctionTool, ToolExecution, ToolRegistry},
+    model::list_remote_models,
+    runtime::types::Event,
+};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelView<'a> {
+    id: &'a str,
+    name: &'a str,
+    protocol: crate::config::ModelProtocol,
+    model: &'a str,
+    base_url: &'a str,
+    active: bool,
+    timeout_ms: u64,
+    context_window: u64,
+    max_output_tokens: Option<u64>,
+    auth: crate::config::ModelAuth,
+    prompt_cache: bool,
+    api_key: &'a Option<String>,
+}
+
+struct Extensions {
+    skills: Arc<SkillRegistry>,
+    plugins: Arc<PluginManager>,
+    tools: Arc<ToolRegistry>,
+}
+
+pub struct AppController {
+    pub distribution: Arc<crate::distribution::Distribution>,
+    _process_lock: std::fs::File,
+    config_edit: Mutex<()>,
+    config_path: PathBuf,
+    config: Mutex<AppConfig>,
+    extensions: RwLock<Extensions>,
+    supervisor: Arc<crate::runtime::Supervisor>,
+    operations: Arc<crate::runtime::operation::operations::OperationEngine>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
+    bound_only: bool,
+}
+
+impl AppController {
+    pub fn shutdown(&self) {
+        self.scheduler.shutdown();
+        if self.bound_only {
+            self.supervisor.shutdown_bound_only();
+        } else {
+            self.supervisor.shutdown();
+        }
+    }
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_mode(path, false)
+    }
+
+    pub(crate) fn load_bound_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_mode(path, true)
+    }
+
+    fn load_with_mode(path: impl AsRef<Path>, bound_only: bool) -> Result<Self> {
+        let config_path = path.as_ref().to_path_buf();
+        let config = AppConfig::load(&config_path)?;
+        if let Some(parent) = config.storage.database.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let process_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(config.storage.database.with_extension("runtime.lock"))?;
+        process_lock
+            .try_lock()
+            .map_err(|_| Error::Conflict("该数据目录已有运行中的 Pudding".into()))?;
+        let mut skills = SkillRegistry::default();
+        let config_dir = config_directory(&config_path);
+        let distribution = Arc::new(crate::distribution::Distribution::load(&config_dir)?);
+        skills.load(&skill_directories(&config, &config_dir))?;
+        for text in crate::extension::skills::EMBEDDED_SKILLS {
+            skills.load_embedded(text)?;
+        }
+        let mut tools = ToolRegistry::default();
+        let mut plugins = PluginManager::default();
+        let scheduler = crate::scheduler::Scheduler::open(&config_path, &config)?;
+        plugins.provide_mcp("windows-scheduler", scheduler.server()?);
+        let bridge = Arc::new(BgiClient::new(config.bridge.clone()));
+        plugins.provide_mcp(
+            "bgi",
+            crate::bridge::mcp::server(bridge.clone(), config.bridge.enabled)?,
+        );
+        plugins.load(
+            &config.plugins.directories,
+            &config.plugins.enabled,
+            &config.plugins.disabled,
+            &mut tools,
+            &mut skills,
+        )?;
+        let skills = Arc::new(skills);
+        let plugins = Arc::new(plugins);
+        register_builtin_tools(
+            &mut tools,
+            plugins.clone(),
+            Arc::new(crate::runtime::workspace::Workspace::from_config(
+                &config_path,
+                (config.host_plugin_enabled() && config.bridge.enabled).then(|| bridge.clone()),
+            )),
+        )?;
+        let tools = Arc::new(tools);
+        let operation_store = Arc::new(
+            crate::runtime::operation::operations::OperationStore::open(&config.storage.database)?,
+        );
+        let artifact_root = config.storage.database.with_extension("artifacts");
+        let artifacts = Arc::new(crate::runtime::store::artifacts::ArtifactStore::new(
+            artifact_root,
+            64 * 1024 * 1024,
+        )?);
+        let operations = Arc::new(crate::runtime::operation::operations::OperationEngine::new(
+            operation_store,
+            artifacts,
+        ));
+        operations.configure_file_brokers(plugins.broker_specs())?;
+        operations.configure_verifiers(plugins.adapters());
+        let build = if bound_only {
+            crate::runtime::Supervisor::new_bound_only
+        } else {
+            crate::runtime::Supervisor::new
+        };
+        let supervisor = build(
+            config.clone(),
+            skills.clone(),
+            tools.clone(),
+            operations.clone(),
+            plugins.adapters().to_vec(),
+        )?;
+        scheduler.attach(&supervisor)?;
+        Ok(Self {
+            _process_lock: process_lock,
+            config_edit: Mutex::new(()),
+            distribution,
+            config_path,
+            config: Mutex::new(config),
+            extensions: RwLock::new(Extensions {
+                skills,
+                plugins,
+                tools,
+            }),
+            supervisor,
+            operations,
+            scheduler,
+            bound_only,
+        })
+    }
+
+    pub fn handle(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+        _emit: Arc<dyn Fn(String, Event) + Send + Sync>,
+    ) -> Result<Value> {
+        let _edit = if matches!(
+            method,
+            "model.use"
+                | "bridge.setEnabled"
+                | "bridge.setLaunchSilently"
+                | "bridge.setLaunchBehavior"
+                | "bridge.restore"
+                | "model.save"
+                | "model.delete"
+                | "skill.setEnabled"
+                | "skill.install"
+                | "plugin.setEnabled"
+                | "plugin.install"
+                | "plugin.remove"
+                | "extensions.reload"
+                | "strategy.extract"
+                | "strategy.run"
+                | "workflow.run"
+                | "shortcut.save"
+                | "shortcut.accept"
+                | "conversation.delete"
+                | "task.submit"
+                | "run.submit"
+                | "run.input"
+                | "run.question.answer"
+                | "workflow.extract"
+                | "permission.set"
+                | "memory.setEnabled"
+                | "config.write"
+        ) {
+            Some(self.config_edit.lock().unwrap())
+        } else {
+            None
+        };
+        match method {
+            "memory.state" => {
+                let mut state = self.supervisor.memory.state_snapshot()?;
+                let enabled = self.supervisor.memory_enabled();
+                state["enabled"] = json!(enabled);
+                state["reviewing"] = json!(enabled && state["reviewing"] == true);
+                Ok(state)
+            }
+            "memory.setEnabled" => {
+                let enabled = params["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("enabled 必须是布尔值".into()))?;
+                let previous = self.supervisor.memory_enabled();
+                AppConfig::set_memory_enabled(&self.config_path, enabled)?;
+                if let Err(error) = self.supervisor.update_memory_enabled(enabled) {
+                    if let Err(rollback) =
+                        AppConfig::set_memory_enabled(&self.config_path, previous)
+                    {
+                        log::error!("记忆开关回写失败：{rollback}");
+                    }
+                    return Err(error);
+                }
+                self.config.lock().unwrap().runtime.memory_enabled = enabled;
+                Ok(json!({"enabled":enabled}))
+            }
+            "memory.list" => {
+                let definitions = self.supervisor.memory_definitions();
+                let entries = self.supervisor.memory.list(200)?;
+                Ok(
+                    json!({"entries":entries.iter().map(|entry| json!({"entry":entry,"compatible":entry.compatible(&definitions)})).collect::<Vec<_>>() }),
+                )
+            }
+            "memory.update" => {
+                let experience: crate::runtime::memory::Experience =
+                    serde_json::from_value(params["experience"].clone())?;
+                let schemas = crate::runtime::memory::tool_schemas(
+                    &experience,
+                    &self.supervisor.memory_definitions(),
+                )?;
+                self.supervisor.memory.edit(
+                    required(&params, "id")?,
+                    params["revision"].as_u64().unwrap_or(0),
+                    &experience,
+                    &schemas,
+                )?;
+                Ok(json!({"updated":true}))
+            }
+            "memory.delete" => {
+                self.supervisor.memory.forget(
+                    required(&params, "id")?,
+                    params["revision"].as_u64().unwrap_or(0),
+                )?;
+                Ok(json!({"deleted":true}))
+            }
+            "release.state" => Ok(self.distribution.state()),
+            "release.check" => {
+                let result = self.distribution.check();
+                let distribution = self.distribution.clone();
+                let target = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value["release"]["version"].as_str())
+                    .map(str::to_owned);
+                let failed = result.is_err();
+                std::thread::spawn(move || {
+                    distribution.record("update_check", target.as_deref());
+                    if failed {
+                        distribution.record("update_failed", None);
+                    } else if target.is_some() {
+                        distribution.record("update_available", target.as_deref());
+                    }
+                });
+                result
+            }
+            "release.configure" => self.distribution.configure(
+                params["analyticsEnabled"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("analyticsEnabled 必须是布尔值".into()))?,
+                required(&params, "channel")?,
+            ),
+            "release.download" => {
+                let result = self.distribution.download();
+                let distribution = self.distribution.clone();
+                let success = result.is_ok();
+                std::thread::spawn(move || {
+                    distribution.record(
+                        if success {
+                            "update_download_complete"
+                        } else {
+                            "update_failed"
+                        },
+                        None,
+                    )
+                });
+                result
+            }
+            "plugin.install" => {
+                let config = self.config.lock().unwrap().clone();
+                let id = crate::runtime::host::installation::install(
+                    &config_directory(&self.config_path),
+                    &config,
+                    Path::new(required(&params, "path")?),
+                )?;
+                self.reload_extensions()?;
+                Ok(json!({"id":id}))
+            }
+            "skill.install" => {
+                let root = AppConfig::ensure_user_skill_directory(&self.config_path)?;
+                *self.config.lock().unwrap() = AppConfig::load(&self.config_path)?;
+                let name = crate::extension::skills::install(
+                    &root,
+                    Path::new(required(&params, "path")?),
+                )?;
+                self.reload_extensions()?;
+                Ok(json!({"name":name}))
+            }
+            "plugin.remove" => {
+                let id = required(&params, "id")?;
+                if crate::extension::providers::is_bundled_plugin(id) {
+                    return Err(Error::Config("随产品提供的插件不能移除。".into()));
+                }
+                let config = self.config.lock().unwrap().clone();
+                crate::runtime::host::installation::remove(
+                    &config_directory(&self.config_path),
+                    &config,
+                    id,
+                )?;
+                self.reload_extensions()?;
+                Ok(json!({"removed":true,"recoverable":true}))
+            }
+            "extensions.reload" => {
+                self.reload_extensions()?;
+                Ok(json!({"reloaded":true}))
+            }
+            "config.read" => Ok(json!({
+                "path": self.config_path.display().to_string(),
+                "content": std::fs::read_to_string(&self.config_path)?,
+            })),
+            "config.write" => {
+                crate::config::AppConfig::write_document(
+                    &self.config_path,
+                    required(&params, "content")?,
+                )?;
+                self.reload_runtime()?;
+                Ok(json!({"saved": true}))
+            }
+            "bootstrap" => self.bootstrap(),
+            "task.submit" | "run.submit" => {
+                let prompt = params["prompt"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| Error::Config("prompt is required".into()))?
+                    .to_owned();
+                let key = params["clientKey"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                // interruptActive=true：用户运行中发送新消息，立即打断同一对话
+                // 较早的 Agent 运行；false 保留原排队行为。
+                let run = if params["interruptActive"].as_bool().unwrap_or(false) {
+                    self.supervisor.submit_interrupted(
+                        &prompt,
+                        params["conversationId"].as_str(),
+                        &key,
+                        params["durationSec"].as_i64(),
+                        params["modelId"].as_str(),
+                    )?
+                } else {
+                    self.supervisor.submit(
+                        &prompt,
+                        params["conversationId"].as_str(),
+                        &key,
+                        params["durationSec"].as_i64(),
+                        params["modelId"].as_str(),
+                    )?
+                };
+                Ok(crate::runtime::types::public_run(&run))
+            }
+            "run.usage" => self
+                .supervisor
+                .journal
+                .model_usage(required(&params, "id")?),
+            "app.identity" => Ok(
+                json!({"version":env!("CARGO_PKG_VERSION"),"revision":env!("PUDDING_SOURCE_REVISION"),"dirty":env!("PUDDING_SOURCE_DIRTY"),"schemaVersion":crate::runtime::store::migrations::LATEST_SCHEMA_VERSION}),
+            ),
+            "task.get" | "run.get" => Ok(crate::runtime::types::public_run(
+                &self.supervisor.journal.get(required(&params, "id")?)?,
+            )),
+            "task.cancel" | "run.cancel" => Ok(crate::runtime::types::public_run(
+                &self.supervisor.cancel(required(&params, "id")?)?,
+            )),
+            "task.resume" | "run.resume" => Ok(crate::runtime::types::public_run(
+                &self
+                    .supervisor
+                    .resume(required(&params, "id")?, params["durationSec"].as_i64())?,
+            )),
+            "run.input" => {
+                self.supervisor.journal.input_once(
+                    required(&params, "id")?,
+                    "supplement",
+                    required(&params, "content")?,
+                    params["clientKey"].as_str(),
+                )?;
+                Ok(json!({"accepted":true}))
+            }
+            "run.question.answer" => {
+                // 结构化问题的专用答复通道：校验归属、状态与内容都在 journal
+                // 的同一事务里完成，这里不落任何用户聊天消息。
+                let recorded = self.supervisor.journal.answer_question_request(
+                    required(&params, "id")?,
+                    required(&params, "requestId")?,
+                    &params["answers"],
+                    params["clientKey"].as_str(),
+                )?;
+                Ok(json!({"accepted":true,"recorded":recorded}))
+            }
+            "approval.respond" => Ok(serde_json::to_value(
+                self.supervisor.journal.decide(
+                    required(&params, "id")?,
+                    params["approved"]
+                        .as_bool()
+                        .ok_or_else(|| Error::Config("approved is required".into()))?,
+                )?,
+            )?),
+            "events.read" => {
+                let conversation = required(&params, "conversationId")?;
+                let after = params["after"].as_u64().unwrap_or(0);
+                let wait = params["waitMs"].as_u64().unwrap_or(0).min(25000);
+                // 等待 journal 的通知，不轮询 SQLite；先注册等待再读事件，唤醒不会丢。
+                let notifier = self.supervisor.journal.notifier();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait);
+                loop {
+                    let changed = notifier.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    let events = self.supervisor.journal.events(conversation, after)?;
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if !events.is_empty() || remaining.is_zero() {
+                        // 游标过旧时要求重取快照。
+                        let expired = self
+                            .supervisor
+                            .journal
+                            .cursor_expired(conversation, after)?;
+                        return Ok(json!({
+                            "events":events,
+                            "snapshotRequired":expired,
+                        }));
+                    }
+                    let _ = crate::runtime::executor()
+                        .block_on(async { tokio::time::timeout(remaining, changed).await });
+                }
+            }
+            "conversation.get" => {
+                let id = required(&params, "id")?;
+                let messages = self.supervisor.journal.conversation_messages(id)?;
+                let (activities, boundary) = self.supervisor.journal.context_activities(id)?;
+                let runs = self
+                    .supervisor
+                    .journal
+                    .conversation_runs(id)?
+                    .iter()
+                    .map(crate::runtime::types::public_run)
+                    .collect::<Vec<_>>();
+                // 当前真正 open 的问题请求：前端清理已回答/已取代卡片靠事件，
+                // 首次快照不能依赖可能被裁剪的旧事件重放。
+                let question_requests = self.supervisor.journal.open_question_requests(id)?;
+                Ok(
+                    json!({"id":id,"messages":messages,"contextActivities":activities,"contextActivityBoundary":boundary,"runs":runs,"questionRequests":question_requests}),
+                )
+            }
+            "conversation.list" => Ok(json!(self.supervisor.conversations(
+                &crate::runtime::store::journal::ConversationQuery {
+                    search: params["search"].as_str().map(str::to_owned),
+                    include_archived: params["includeArchived"].as_bool().unwrap_or(false),
+                    offset: params["offset"].as_u64().unwrap_or(0) as usize,
+                    limit: params["limit"].as_u64().unwrap_or(50) as usize,
+                }
+            )?)),
+            "conversation.rename" => {
+                self.supervisor
+                    .journal
+                    .rename_conversation(required(&params, "id")?, required(&params, "title")?)?;
+                Ok(json!({"saved":true}))
+            }
+            "conversation.setPinned" => {
+                self.supervisor.journal.set_conversation_pinned(
+                    required(&params, "id")?,
+                    params["pinned"]
+                        .as_bool()
+                        .ok_or_else(|| Error::Config("pinned 必须是布尔值".into()))?,
+                )?;
+                Ok(json!({"saved":true}))
+            }
+            "conversation.setArchived" => {
+                self.supervisor.journal.set_conversation_archived(
+                    required(&params, "id")?,
+                    params["archived"]
+                        .as_bool()
+                        .ok_or_else(|| Error::Config("archived 必须是布尔值".into()))?,
+                )?;
+                Ok(json!({"saved":true}))
+            }
+            "conversation.groups.save" => {
+                let layout: crate::runtime::store::journal::GroupLayout =
+                    serde_json::from_value(params.clone())?;
+                self.supervisor.journal.save_conversation_groups(&layout)?;
+                Ok(json!({"saved":true}))
+            }
+            "conversation.setModel" => {
+                let id = required(&params, "id")?;
+                let model = required(&params, "modelId")?;
+                if !self
+                    .config
+                    .lock()
+                    .unwrap()
+                    .models
+                    .iter()
+                    .any(|entry| entry.id == model)
+                {
+                    return Err(Error::Config("模型配置不存在".into()));
+                }
+                self.supervisor
+                    .journal
+                    .set_conversation_model(id, Some(model))?;
+                Ok(json!({"saved":true,"modelId":model}))
+            }
+            "conversation.delete" => {
+                let id = required(&params, "id")?;
+                let summary = self
+                    .supervisor
+                    .journal
+                    .conversation(id)
+                    .map(|conversation| {
+                        json!({
+                            "title":conversation.title,
+                            "taskCount":conversation.task_count,
+                        })
+                    })
+                    .unwrap_or_else(|_| json!({"title":"","taskCount":0}));
+                if params["confirmed"].as_bool() != Some(true) {
+                    return Ok(json!({
+                        "requiresConfirmation":true,
+                        "affects":summary,
+                        "keeps":"会停止这个对话的运行，并永久删除消息、事件、检查点与执行记录。独立保存的快捷任务保留。",
+                    }));
+                }
+                crate::runtime::executor().block_on(self.supervisor.delete_conversation(id))
+            }
+            "task.list" => Ok(json!(
+                self.supervisor
+                    .journal
+                    .list()?
+                    .iter()
+                    .map(crate::runtime::types::public_run)
+                    .collect::<Vec<_>>()
+            )),
+            "conversation.fork" => Ok(json!({"id":self.supervisor.journal.fork_conversation(
+                required(&params,"id")?,params["title"].as_str()
+            )?})),
+            "strategy.extract" => Ok(serde_json::to_value(
+                self.supervisor
+                    .journal
+                    .create_strategy(required(&params, "runId")?, required(&params, "name")?)?,
+            )?),
+            "strategy.run" => {
+                let key = params["clientKey"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                Ok(crate::runtime::types::public_run(
+                    &self.supervisor.submit_strategy(
+                        required(&params, "id")?,
+                        &key,
+                        params["durationSec"].as_i64(),
+                    )?,
+                ))
+            }
+            "workflow.extract" => self.extract_task(&params),
+            "shortcut.save" => self
+                .supervisor
+                .save_shortcut(&params, params["sourceConversationId"].as_str()),
+            "shortcut.accept" => self.supervisor.accept_shortcut(
+                required(&params, "runId")?,
+                required(&params, "name")?,
+                params["description"].as_str().unwrap_or(""),
+            ),
+            "shortcut.configure" => {
+                let key = params["clientKey"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                Ok(crate::runtime::types::public_run(
+                    &self.supervisor.configure_shortcut(
+                        required(&params, "prompt")?,
+                        params["conversationId"].as_str(),
+                        &key,
+                        params["modelId"].as_str(),
+                        params["shortcutId"].as_str(),
+                        params["referenceConversationId"].as_str(),
+                    )?,
+                ))
+            }
+            "workflow.draft.create" | "workflow.draft.update" => self.save_draft(&params),
+            "workflow.validate" => {
+                let task_id = required(&params, "id")?;
+                let revision = match params["draftRevision"].as_u64() {
+                    Some(revision) => self.supervisor.tasks.revision(task_id, revision)?,
+                    None => self
+                        .supervisor
+                        .tasks
+                        .published_revision(task_id)?
+                        .ok_or_else(|| Error::Config("这个快捷任务还没有可校验的定义".into()))?,
+                };
+                Ok(json!({
+                    "validation":revision.validation,
+                    "publishable":revision.validation.publishable(),
+                    "zeroToken":revision.model_usage.is_deterministic(),
+                    "modelUsage":revision.model_usage,
+                }))
+            }
+            "workflow.publish" => self.publish_task(&params),
+            "workflow.get" => {
+                let id = required(&params, "id")?;
+                let definition = self.supervisor.tasks.definition(id)?;
+                let conversations = self
+                    .supervisor
+                    .journal
+                    .conversations()?
+                    .into_iter()
+                    .map(|conversation| conversation.id)
+                    .collect::<std::collections::HashSet<_>>();
+                let names = self
+                    .supervisor
+                    .tool_definitions()
+                    .into_iter()
+                    .map(|definition| definition.name)
+                    .collect::<std::collections::HashSet<_>>();
+                let is_available = |name: &str| names.contains(name);
+                let revision = definition
+                    .published_revision
+                    .and_then(|revision| self.supervisor.tasks.revision(id, revision).ok());
+                Ok(json!({
+                    "summary":self.supervisor.tasks.summary(&definition, &is_available, &self.supervisor.introduced_providers(), &conversations),
+                    "definition":definition,
+                    "revision":revision,
+                    "runs":self.supervisor.tasks.run_ids(id, 20)?,
+                }))
+            }
+            "workflow.list" => Ok(json!(
+                self.supervisor
+                    .task_summaries(params["conversationId"].as_str())?
+            )),
+            "workflow.run" => {
+                let key = params["clientKey"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                Ok(crate::runtime::types::public_run(
+                    &self.supervisor.submit_workflow(
+                        required(&params, "id")?,
+                        params["expectedPublishedRevision"].as_u64(),
+                        &key,
+                        params["durationSec"].as_i64(),
+                    )?,
+                ))
+            }
+            "workflow.rename" | "workflow.pin" => self.patch_task(&params, method),
+            "workflow.delete" => {
+                let id = required(&params, "id")?;
+                self.supervisor.delete_workflow(id)?;
+                Ok(json!({
+                    "deleted":true,
+                    "activeRuns":self.supervisor.task_run_ids(id)?,
+                    "historyKept":true,
+                }))
+            }
+            "workflow.copy" => {
+                let source = self.supervisor.tasks.definition(required(&params, "id")?)?;
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut definition = source.clone();
+                definition.id = id.clone();
+                definition.name = format!("{} 的副本", source.name);
+                definition.published_revision = None;
+                definition.draft_revision = None;
+                definition.last_run_id = None;
+                definition.pinned = false;
+                definition.created_at = crate::runtime::types::now();
+                definition.updated_at = definition.created_at.clone();
+                // 生成新 ID，保留来源说明，不复用原活动运行与外部 Job。
+                definition.source_message_id = None;
+                self.supervisor.tasks.create_definition(&definition)?;
+                if let Some(mut revision) = self.supervisor.tasks.latest_revision(&source.id)? {
+                    revision.task_id = id.clone();
+                    self.supervisor.tasks.save_revision(&revision)?;
+                    definition.draft_revision = Some(revision.revision);
+                    self.supervisor.tasks.save_definition(&definition)?;
+                }
+                Ok(json!({"id":id}))
+            }
+            "operation.list" => Ok(json!(self.operations.store.list()?)),
+            "operation.get" => Ok(json!(self.operations.store.get(required(&params, "id")?)?)),
+            "operation.create" => {
+                let plan: crate::runtime::operation::kernel::MutationPlan =
+                    serde_json::from_value(params["plan"].clone())?;
+                let operation = self.operations.store.create(
+                    params["runId"].as_str(),
+                    required(&params, "title")?,
+                    plan,
+                )?;
+                Ok(json!(self.operations.request_authorization(&operation.id)?))
+            }
+            "operation.execute" => Ok(json!(
+                self.operations
+                    .execute_pre_authorized(required(&params, "id")?)?
+            )),
+            "operation.rollback" => Ok(json!(self.operations.rollback(required(&params, "id")?)?)),
+            "operation.cancel" => Ok(json!(self.operations.cancel(required(&params, "id")?)?)),
+            "resource.list" => Ok(json!(self.operations.store.resources()?)),
+            "resource.snapshot" => {
+                let resource = self.operations.store.resource(required(&params, "id")?)?;
+                Ok(json!(self.operations.snapshot(&resource)?))
+            }
+            "resource.inspect" => {
+                let resource = self.operations.store.resource(required(&params, "id")?)?;
+                let snapshot = self.operations.snapshot(&resource)?;
+                let content = self.operations.artifacts.get(&snapshot.content_artifact)?;
+                let extensions = self.extensions.read().unwrap();
+                let adapter = extensions
+                    .plugins
+                    .adapters()
+                    .iter()
+                    .find(|adapter| adapter.provider_id() == resource.provider_id)
+                    .ok_or_else(|| Error::Config("资源所属 Adapter 当前不可用".into()))?;
+                let view = adapter.inspect(&snapshot, &content, params["request"].clone())?;
+                Ok(json!({"snapshot":snapshot,"view":view}))
+            }
+            "run.checkpoint" => Ok(json!(
+                self.supervisor
+                    .journal
+                    .checkpoint(required(&params, "id")?)?
+            )),
+            "diagnostics.list" => Ok(json!(self.operations.store.diagnostics()?)),
+            "metrics.list" => {
+                Ok(json!(self.operations.store.metrics(
+                    params["limit"].as_u64().unwrap_or(200) as usize
+                )?))
+            }
+            "preferences.list" => {
+                Ok(json!(self.operations.store.preferences(
+                    params["scope"].as_str().unwrap_or("global")
+                )?))
+            }
+            "preferences.save" => {
+                let preference: crate::runtime::operation::kernel::PreferenceRecord =
+                    serde_json::from_value(params["preference"].clone())?;
+                self.operations.store.save_preference(&preference)?;
+                Ok(json!({"saved":true}))
+            }
+            "preferences.delete" => {
+                self.operations
+                    .store
+                    .delete_preference(required(&params, "key")?, required(&params, "scope")?)?;
+                Ok(json!({"deleted":true}))
+            }
+            "grant.list" => Ok(json!(self.operations.store.grants()?)),
+            "grant.save" => {
+                let grant: crate::runtime::operation::permissions::TrustGrant =
+                    serde_json::from_value(params["grant"].clone())?;
+                self.operations.store.save_grant(&grant)?;
+                Ok(json!({"saved":true}))
+            }
+            "grant.revoke" => {
+                self.operations
+                    .store
+                    .revoke_grant(required(&params, "id")?)?;
+                Ok(json!({"revoked":true}))
+            }
+            "notification.list" => {
+                Ok(json!(self.operations.store.notifications(
+                    params["unreadOnly"].as_bool().unwrap_or(true)
+                )?))
+            }
+            "notification.read" => {
+                self.operations
+                    .store
+                    .mark_notification_read(required(&params, "id")?)?;
+                Ok(json!({"read":true}))
+            }
+            "adapter.discover" => {
+                let plugin_id = required(&params, "pluginId")?;
+                let adapter_id = required(&params, "adapterId")?;
+                let extensions = self.extensions.read().unwrap();
+                let adapter = extensions
+                    .plugins
+                    .adapters()
+                    .iter()
+                    .find(|adapter| {
+                        adapter.plugin_id == plugin_id && adapter.adapter_id == adapter_id
+                    })
+                    .ok_or_else(|| Error::Config("Adapter 不存在或未启用".into()))?;
+                let resources = adapter.discover(params["input"].clone())?;
+                for resource in &resources {
+                    if resource.provider_id != adapter.provider_id() {
+                        return Err(Error::Tool("Adapter 返回了越权 Provider 资源".into()));
+                    }
+                    self.operations.store.upsert_resource(resource)?;
+                }
+                Ok(json!({"resources":resources}))
+            }
+            "adapter.planMutation" => {
+                let plugin_id = required(&params, "pluginId")?;
+                let adapter_id = required(&params, "adapterId")?;
+                let extensions = self.extensions.read().unwrap();
+                let adapter = extensions
+                    .plugins
+                    .adapters()
+                    .iter()
+                    .find(|adapter| {
+                        adapter.plugin_id == plugin_id && adapter.adapter_id == adapter_id
+                    })
+                    .ok_or_else(|| Error::Config("Adapter 不存在或未启用".into()))?;
+                let snapshot_ids = params["snapshotIds"]
+                    .as_array()
+                    .ok_or_else(|| Error::Config("snapshotIds must be an array".into()))?;
+                let snapshots = snapshot_ids
+                    .iter()
+                    .map(|id| {
+                        let snapshot = self.operations.store.snapshot(id.as_str().unwrap_or(""))?;
+                        let content = self.operations.artifacts.get(&snapshot.content_artifact)?;
+                        Ok((snapshot, content))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let plan = adapter.plan(
+                    &snapshots,
+                    params["request"].clone(),
+                    &self.operations.artifacts,
+                )?;
+                let operation = self.operations.store.create(
+                    params["runId"].as_str(),
+                    required(&params, "title")?,
+                    plan,
+                )?;
+                let operation = self.operations.request_authorization(&operation.id)?;
+                Ok(json!({"operation":operation,"requiresAuthorization":true}))
+            }
+            "adapter.diagnose" => {
+                let plugin_id = required(&params, "pluginId")?;
+                let adapter_id = required(&params, "adapterId")?;
+                let extensions = self.extensions.read().unwrap();
+                let adapter = extensions
+                    .plugins
+                    .adapters()
+                    .iter()
+                    .find(|adapter| {
+                        adapter.plugin_id == plugin_id && adapter.adapter_id == adapter_id
+                    })
+                    .ok_or_else(|| Error::Config("Adapter 不存在或未启用".into()))?;
+                let findings = adapter.diagnose(params["input"].clone())?;
+                for finding in &findings {
+                    if finding.provider_id != adapter.provider_id() {
+                        return Err(Error::Tool("Adapter 返回了越权诊断结果".into()));
+                    }
+                    self.operations.store.save_diagnostic(finding)?;
+                }
+                Ok(json!({"findings":findings}))
+            }
+            "permission.get" => {
+                use crate::runtime::operation::permissions::PermissionMode;
+                let mode = self.config.lock().unwrap().runtime.permission_mode;
+                Ok(json!({
+                    "mode":mode,
+                    "label":mode.label(),
+                    "description":mode.description(),
+                    "levels":PermissionMode::levels()
+                        .iter()
+                        .map(|(mode, label, description)| json!({
+                            "value":mode,
+                            "label":label,
+                            "description":description,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+            }
+            "permission.set" => {
+                use crate::runtime::operation::permissions::PermissionMode;
+                let mode: PermissionMode = serde_json::from_value(params["mode"].clone())
+                    .map_err(|_| Error::Config("未知的审批级别".into()))?;
+                AppConfig::set_permission_mode(&self.config_path, mode)?;
+                // 对话执行中可切：走热更新，只同步两份内存配置的这一字段，
+                // 不取 model_gate、不重建 hooks/plugins、不打断当前任务。
+                self.config.lock().unwrap().runtime.permission_mode = mode;
+                self.supervisor.update_permission_mode(mode);
+                Ok(json!({"mode":mode,"label":mode.label()}))
+            }
+            "model.use" => self.use_model(required(&params, "id")?),
+            "model.list" => self.list_models(&params),
+            "model.save" => {
+                AppConfig::save_model(&self.config_path, &params["model"])?;
+                self.reload_runtime()?;
+                Ok(json!({"saved":true}))
+            }
+            "model.delete" => self.delete_model(required(&params, "id")?),
+            "skill.setEnabled" => {
+                let name = required(&params, "name")?;
+                let enabled = params["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("enabled is required".into()))?;
+                AppConfig::set_skill_enabled(&self.config_path, name, enabled)?;
+                self.reload_runtime()?;
+                Ok(json!({"enabled":enabled}))
+            }
+            "plugin.setEnabled" => {
+                let id = required(&params, "id")?;
+                let enabled = params["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("enabled is required".into()))?;
+                AppConfig::set_plugin_enabled(&self.config_path, id, enabled)?;
+                self.reload_runtime()?;
+                self.reload_extensions()?;
+                Ok(json!({"restartRequired":false}))
+            }
+            "bridge.state" => BgiClient::new(self.config.lock().unwrap().bridge.clone()).state(),
+            "bridge.status" => Ok(self.bridge_status()),
+            "bridge.recoveryList" => crate::bridge::control::recovery("list", &[]),
+            "bridge.recoveryStatus" => {
+                crate::bridge::control::recovery("status", &[&params["targets"].to_string()])
+            }
+            "bridge.recoveryPreview" => {
+                let config = self.config.lock().unwrap().bridge.clone();
+                crate::bridge::recovery::preview(&config, &params)
+            }
+            "bridge.restore" => {
+                let config = self.config.lock().unwrap().bridge.clone();
+                crate::bridge::recovery::restore(&config, &params)
+            }
+            "bridge.catalog" | "bridge.describe" => {
+                let mut config = self.config.lock().unwrap().bridge.clone();
+                config.enabled = true;
+                let client = BgiClient::new(config);
+                if method == "bridge.describe" {
+                    client.describe(required(&params, "methodId")?)
+                } else {
+                    client.catalog_page(
+                        params["query"].as_str().unwrap_or(""),
+                        params["group"].as_str(),
+                        params["offset"].as_u64().unwrap_or(0),
+                    )
+                }
+            }
+            "bridge.setEnabled" => {
+                let enabled = params["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("enabled 必须是布尔值".into()))?;
+                self.set_bridge_enabled(enabled)
+            }
+            "bridge.setLaunchSilently" => {
+                let silently = params["silently"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("silently 必须是布尔值".into()))?;
+                self.set_bridge_launch_silently(silently)
+            }
+            "bridge.setLaunchBehavior" => {
+                let auto_start = params["autoStart"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("autoStart 必须是布尔值".into()))?;
+                let silently = params["launchSilently"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("launchSilently 必须是布尔值".into()))?;
+                self.set_bridge_launch_behavior(auto_start, silently)
+            }
+            _ if method.starts_with("scheduler.") => {
+                crate::scheduler::handle(&self.scheduler, method, &params)
+            }
+            _ => Err(Error::Config(format!("unknown IPC method: {method}"))),
+        }
+    }
+
+    /// 保存或更新草稿，不执行、不发布、不产生外部写入。
+    fn save_draft(&self, params: &Value) -> Result<Value> {
+        use crate::runtime::operation::task::{TaskLimits, TaskNode, compile};
+
+        let nodes: Vec<TaskNode> = serde_json::from_value(params["nodes"].clone())
+            .map_err(|error| Error::Config(format!("任务定义无法解析：{error}")))?;
+        let limits: Option<TaskLimits> = match params.get("limits") {
+            Some(value) if !value.is_null() => Some(serde_json::from_value(value.clone())?),
+            _ => None,
+        };
+        let catalog = self.supervisor.tool_catalog();
+        let existing = params["id"]
+            .as_str()
+            .map(str::to_owned)
+            .filter(|id| !id.is_empty());
+        let task_id = existing
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let definition = match &existing {
+            Some(id) => self.supervisor.tasks.definition(id)?,
+            None => crate::runtime::operation::task::WorkflowDefinition {
+                id: task_id.clone(),
+                name: params["name"].as_str().unwrap_or("新快捷任务").into(),
+                description: params["description"].as_str().unwrap_or("").into(),
+                source_conversation_id: params["sourceConversationId"].as_str().map(str::to_owned),
+                source_message_id: params["sourceMessageId"].as_str().map(str::to_owned),
+                source_title_snapshot: params["sourceTitleSnapshot"].as_str().unwrap_or("").into(),
+                published_revision: None,
+                draft_revision: None,
+                pinned: false,
+                last_run_id: None,
+                created_at: crate::runtime::types::now(),
+                updated_at: crate::runtime::types::now(),
+            },
+        };
+        let revision_number = self.supervisor.tasks.next_revision_number(&task_id)?;
+        let revision = compile(
+            &task_id,
+            revision_number,
+            params["name"].as_str().unwrap_or(&definition.name),
+            params["description"]
+                .as_str()
+                .unwrap_or(&definition.description),
+            nodes,
+            limits,
+            &catalog,
+        )?;
+        let mut definition = definition;
+        definition.draft_revision = Some(revision_number);
+        definition.updated_at = crate::runtime::types::now();
+        if existing.is_some() {
+            self.supervisor.tasks.save_definition(&definition)?;
+        } else {
+            self.supervisor.tasks.create_definition(&definition)?;
+        }
+        self.supervisor.tasks.save_revision(&revision)?;
+        Ok(json!({
+            "id":task_id,
+            "revision":revision_number,
+            "validation":revision.validation,
+            "state":"draft",
+        }))
+    }
+
+    /// 发布一份不可变修订，本身不产生真实工具写入。
+    fn publish_task(&self, params: &Value) -> Result<Value> {
+        let id = required(params, "id")?;
+        let revision_number = params["draftRevision"]
+            .as_u64()
+            .ok_or_else(|| Error::Config("需要指出要发布的草稿版本".into()))?;
+        let revision = self.supervisor.tasks.revision(id, revision_number)?;
+        if !revision.validation.publishable() {
+            return Err(Error::Conflict(format!(
+                "任务还不能发布：{}",
+                revision
+                    .validation
+                    .issues
+                    .first()
+                    .map(|issue| issue.message.clone())
+                    .unwrap_or_else(|| "缺少必要信息".into())
+            )));
+        }
+        let mut definition = self.supervisor.tasks.definition(id)?;
+        if let Some(expected) = params["expectedPublishedRevision"].as_u64()
+            && definition
+                .published_revision
+                .is_some_and(|current| current != expected)
+        {
+            return Err(Error::Conflict(
+                "任务已经发布过更新的版本，请再试一次".into(),
+            ));
+        }
+        definition.published_revision = Some(revision_number);
+        definition.draft_revision = None;
+        definition.name = revision.name.clone();
+        definition.description = revision.description.clone();
+        definition.updated_at = crate::runtime::types::now();
+        self.supervisor.tasks.save_definition(&definition)?;
+        Ok(json!({
+            "taskId":id,
+            "publishedRevision":revision_number,
+            "zeroToken":revision.model_usage.is_deterministic(),
+        }))
+    }
+
+    /// 改名和置顶不触碰执行语义与稳定 ID。
+    fn patch_task(&self, params: &Value, method: &str) -> Result<Value> {
+        use crate::runtime::operation::task_store::DefinitionPatch;
+        let id = required(params, "id")?;
+        let mut definition = self.supervisor.tasks.definition(id)?;
+        let patch = match method {
+            "workflow.rename" => DefinitionPatch {
+                name: Some(required(params, "name")?.to_owned()),
+                description: params["description"].as_str().map(str::to_owned),
+                pinned: None,
+            },
+            "workflow.pin" => DefinitionPatch {
+                pinned: Some(
+                    params["pinned"]
+                        .as_bool()
+                        .ok_or_else(|| Error::Config("pinned 必须是布尔值".into()))?,
+                ),
+                ..DefinitionPatch::default()
+            },
+            _ => return Err(Error::Config("未知快捷任务操作".into())),
+        };
+        definition.apply(patch)?;
+        self.supervisor.tasks.save_definition(&definition)?;
+        Ok(json!({"saved":true}))
+    }
+
+    /// 从一次已验证运行提取快捷任务，固定执行契约与真实资源。
+    fn extract_task(&self, params: &Value) -> Result<Value> {
+        use crate::runtime::operation::task::{
+            FailurePolicy, SequenceNode, TaskNode, ToolNode, compile,
+        };
+        let run_id = required(params, "runId")?;
+        let run = self.supervisor.journal.get(run_id)?;
+        if !matches!(
+            run.state,
+            crate::runtime::types::RunState::Succeeded | crate::runtime::types::RunState::Answered
+        ) {
+            return Err(Error::Conflict(
+                "只有已验证成功的运行可以提取为快捷任务".into(),
+            ));
+        }
+        let plan = self
+            .supervisor
+            .journal
+            .plan(run_id)?
+            .ok_or_else(|| Error::Conflict("该运行没有结构化计划".into()))?;
+        let outcomes = self.supervisor.journal.step_outcomes(run_id)?;
+        let mut nodes = Vec::new();
+        for step in plan.steps {
+            if !matches!(
+                outcomes.get(&step.id).map(String::as_str),
+                Some("completed" | "verifiedSucceeded")
+            ) {
+                return Err(Error::Conflict("计划包含没有完成验证的步骤".into()));
+            }
+            let tool = step.tool.ok_or_else(|| {
+                Error::Conflict("包含旧版领域能力的运行请使用兼容策略提取".into())
+            })?;
+            nodes.push(TaskNode::Tool(ToolNode {
+                id: step.id,
+                title: step.title,
+                tool: Some(tool),
+                capability_id: step.capability_id,
+                // 旧 Job ID 是历史证据，不是新运行的输入参数。
+                arguments: step.arguments,
+                execution: step.execution.map(Box::new),
+                provider_version: step.provider_version,
+                resource_versions: step.resource_versions,
+                on_failure: FailurePolicy::Stop,
+                on_unverified: FailurePolicy::Stop,
+            }));
+        }
+        let nodes = vec![TaskNode::Sequence(SequenceNode {
+            id: "steps".into(),
+            title: plan.goal.clone(),
+            nodes,
+        })];
+        let catalog = self.supervisor.tool_catalog();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let revision = compile(
+            &task_id,
+            1,
+            params["name"].as_str().unwrap_or(&plan.goal),
+            "由已验证运行提取",
+            nodes,
+            None,
+            &catalog,
+        )?;
+        let definition = crate::runtime::operation::task::WorkflowDefinition {
+            id: task_id.clone(),
+            name: revision.name.clone(),
+            description: revision.description.clone(),
+            source_conversation_id: Some(run.conversation_id.clone()),
+            source_message_id: None,
+            source_title_snapshot: plan.goal.clone(),
+            // 这一份修订还没有执行过，状态仍是「尚未实机验证」。
+            published_revision: Some(1),
+            draft_revision: None,
+            pinned: false,
+            last_run_id: None,
+            created_at: crate::runtime::types::now(),
+            updated_at: crate::runtime::types::now(),
+        };
+        self.supervisor.tasks.create_definition(&definition)?;
+        self.supervisor.tasks.save_revision(&revision)?;
+        Ok(json!({
+            "id":task_id,
+            "taskId":task_id,
+            "revision":1,
+            "validation":revision.validation,
+        }))
+    }
+
+    fn set_bridge_enabled(&self, enabled: bool) -> Result<Value> {
+        if enabled {
+            self.connect_bridge_inner()?;
+            Ok(json!({"enabled":true}))
+        } else {
+            let mut config = self.config.lock().unwrap().bridge.clone();
+            config.enabled = false;
+            AppConfig::set_bridge(&self.config_path, &config)?;
+            self.reload_runtime()?;
+            self.reload_extensions()?;
+            let warning = crate::bridge::control::disable(&config);
+            log::info!(
+                "BetterGI 连接已关闭：{}",
+                warning.as_deref().unwrap_or("已断开")
+            );
+            Ok(json!({"enabled":false,"warning":warning}))
+        }
+    }
+
+    /// Connect to BetterGI, honoring the opt-in launch preference.
+    pub fn connect_bridge(&self) -> Result<()> {
+        let _edit = self.config_edit.lock().unwrap();
+        self.connect_bridge_inner()
+    }
+
+    fn connect_bridge_inner(&self) -> Result<()> {
+        let mut config = self.config.lock().unwrap().bridge.clone();
+        log::info!("正在连接 BetterGI（{}）", config.base_url);
+        crate::bridge::control::prepare(&mut config)
+            .inspect_err(|error| log::warn!("准备桥失败：{error}"))?;
+        AppConfig::set_bridge(&self.config_path, &config)?;
+        self.reload_runtime()?;
+        crate::bridge::control::enable(&config)
+            .inspect_err(|error| log::warn!("注入或启用桥失败：{error}"))?;
+        config.enabled = true;
+        config.instance_id = None;
+        let remembered = BgiClient::new(config.clone())
+            .host()
+            .ok()
+            .and_then(|host| host["installPath"].as_str().map(str::to_owned));
+        if let Some(install) = remembered {
+            let install = std::path::PathBuf::from(install);
+            if config.host_install_path.as_deref() != Some(install.as_path()) {
+                log::info!("记住 BetterGI 安装位置：{}", install.display());
+                config.host_install_path = Some(install);
+            }
+        }
+        AppConfig::set_bridge(&self.config_path, &config)?;
+        self.reload_runtime()?;
+        self.reload_extensions()?;
+        log::info!("BetterGI 已连接（{}）", config.base_url);
+        if self.bridge_stale() {
+            log::info!("检测到旧版桥驻留，开始自动接管");
+            if crate::bridge::control::disable(&config).is_some() {
+                return Err(Error::Tool(
+                    "旧版 BetterGI 连接未能停用，请稍后重试。".into(),
+                ));
+            }
+            let mut replacement = config.clone();
+            let takeover = (|| {
+                crate::bridge::control::prepare(&mut replacement)?;
+                crate::bridge::control::enable(&replacement)?;
+                replacement.enabled = true;
+                replacement.instance_id = None;
+                AppConfig::set_bridge(&self.config_path, &replacement)?;
+                self.reload_runtime()?;
+                self.reload_extensions()?;
+                Ok::<(), Error>(())
+            })();
+            if let Err(error) = takeover {
+                log::warn!("新版桥接管失败：{error}");
+                if replacement.base_url != config.base_url {
+                    let _ = crate::bridge::control::disable(&replacement);
+                }
+                AppConfig::set_bridge(&self.config_path, &config)?;
+                self.reload_runtime()?;
+                self.reload_extensions()?;
+                crate::bridge::control::enable(&config).map_err(|restore| {
+                    log::warn!("BetterGI 连接更新与恢复失败：{error}；{restore}");
+                    Error::Tool("BetterGI 连接更新失败，请重启 BetterGI 后重新连接。".into())
+                })?;
+                return Err(error);
+            }
+            log::info!("新版桥已接管（{}）", replacement.base_url);
+        }
+        Ok(())
+    }
+
+    fn set_bridge_launch_silently(&self, silently: bool) -> Result<Value> {
+        let mut current = self.config.lock().expect("config mutex poisoned");
+        let mut bridge = current.bridge.clone();
+        bridge.launch_silently = silently;
+        AppConfig::set_bridge(&self.config_path, &bridge)?;
+        current.bridge = bridge;
+        Ok(json!({"launchSilently":silently}))
+    }
+
+    fn set_bridge_launch_behavior(&self, auto_start: bool, silently: bool) -> Result<Value> {
+        let mut current = self.config.lock().expect("config mutex poisoned");
+        let mut bridge = current.bridge.clone();
+        bridge.auto_start = auto_start;
+        bridge.launch_silently = silently;
+        AppConfig::set_bridge(&self.config_path, &bridge)?;
+        current.bridge = bridge;
+        Ok(json!({"autoStart":auto_start,"launchSilently":silently}))
+    }
+
+    /// 桥开关当前是否打开。给桌面壳的监视循环用。
+    pub fn bridge_enabled(&self) -> bool {
+        self.config.lock().unwrap().bridge.enabled
+    }
+
+    /// 桥是否已连上（短超时探测）。给桌面壳的监视循环用。
+    pub fn bridge_connected(&self) -> bool {
+        let mut config = self.config.lock().unwrap().bridge.clone();
+        config.timeout_ms = config.timeout_ms.min(2000);
+        BgiClient::new(config)
+            .info()
+            .is_ok_and(|info| info["enabled"] != false)
+    }
+
+    /// 给界面同步连接状态的被动探测；不连接、注入或刷新全部会话数据。
+    fn bridge_status(&self) -> Value {
+        let config = self.config.lock().unwrap().bridge.clone();
+        Self::bridge_status_for(config)
+    }
+
+    fn bridge_status_for(mut config: crate::config::BridgeConfig) -> Value {
+        config.timeout_ms = config.timeout_ms.min(2000);
+        if !config.enabled {
+            return json!({"enabled":false,"connected":false,"baseUrl":config.base_url,"autoStart":config.auto_start,"launchSilently":config.launch_silently});
+        }
+        match crate::bridge::control::info(&config) {
+            Ok(info) => {
+                let stale = info["bridgeCode"]
+                    .as_str()
+                    .zip(crate::bridge::control::installed_bridge_code())
+                    .is_some_and(|(live, installed)| live != installed);
+                json!({"enabled":true,"connected":info["enabled"] != false,"baseUrl":config.base_url,"autoStart":config.auto_start,"launchSilently":config.launch_silently,"stale":stale})
+            }
+            Err(error) => {
+                let message = match &error {
+                    Error::Tool(message) if message == crate::bridge::origin::REJECTED_MESSAGE => {
+                        message.clone()
+                    }
+                    _ => error.to_string(),
+                };
+                json!({"enabled":true,"connected":false,"baseUrl":config.base_url,"autoStart":config.auto_start,"launchSilently":config.launch_silently,"error":message})
+            }
+        }
+    }
+
+    /// 已连接的桥是否落后于安装目录。旧桥没有 bridgeCode 字段时视为一致，避免误报。
+    pub fn bridge_stale(&self) -> bool {
+        let mut config = self.config.lock().unwrap().bridge.clone();
+        config.timeout_ms = config.timeout_ms.min(2000);
+        let Some(live) = BgiClient::new(config)
+            .info()
+            .ok()
+            .and_then(|info| info["bridgeCode"].as_str().map(str::to_owned))
+        else {
+            return false;
+        };
+        crate::bridge::control::installed_bridge_code().is_some_and(|installed| installed != live)
+    }
+
+    /// 急停：请求停止所有执行中与排队的运行。返回请求停止的数量。
+    pub fn cancel_active_runs(&self) -> usize {
+        self.supervisor.cancel_active_runs()
+    }
+
+    /// 是否有运行在执行或排队。托盘状态用它判断要不要提示急停热键。
+    pub fn has_active_runs(&self) -> bool {
+        self.supervisor.has_active_runs()
+    }
+
+    fn bootstrap(&self) -> Result<Value> {
+        self.ensure_conversation_models()?;
+        let extensions = self.extensions.read().unwrap();
+        let config = self.config.lock().expect("config mutex poisoned");
+        let models = config
+            .models
+            .iter()
+            .map(|model| ModelView {
+                id: &model.id,
+                name: &model.name,
+                protocol: model.protocol,
+                model: &model.model,
+                base_url: &model.base_url,
+                active: model.id == config.active_model,
+                timeout_ms: model.options.timeout_ms,
+                context_window: model.options.context_window,
+                max_output_tokens: model.options.max_output_tokens,
+                auth: model.auth,
+                prompt_cache: model.options.prompt_cache,
+                api_key: &model.api_key,
+            })
+            .collect::<Vec<_>>();
+        let permission = {
+            use crate::runtime::operation::permissions::PermissionMode;
+            let mode = config.runtime.permission_mode;
+            json!({
+                "mode":mode,
+                "label":mode.label(),
+                "description":mode.description(),
+                "levels":PermissionMode::levels()
+                    .iter()
+                    .map(|(mode, label, description)| json!({
+                        "value":mode,
+                        "label":label,
+                        "description":description,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        };
+        let skill_environment = self.supervisor.skill_environment(&config);
+        let skill_context = skill_environment.context();
+        let online: Vec<&str> = skill_context.providers.iter().map(String::as_str).collect();
+        let skills = extensions
+            .skills
+            .standalone()
+            .into_iter()
+            .map(|skill| {
+                json!({
+                    "name":skill.name,
+                    "displayName":skill.display_name,
+                    "description":skill.description,
+                    "source":skill.source,
+                    "tags":skill.tags,
+                    "requiresPlugins":skill.requires_plugins,
+                    "requiresCapabilities":skill.requires_capabilities,
+                    "resourceKinds":skill.resource_kinds,
+                    "platforms":skill.platforms,
+                    "allowedTools":skill.allowed_tools,
+                    "alwaysLoad":skill.always_load,
+                    "requiresProviders":skill.requires_providers,
+                    "instructions":skill.body,
+                    // 「启用」是用户的开关，「可用」还取决于依赖是否在线。
+                    "enabled":!config.agent.disabled_skills.contains(&skill.name),
+                    "available":!config.agent.disabled_skills.contains(&skill.name)
+                        && extensions.skills.eligible(&skill, &skill_context),
+                    "unavailableReason": crate::extension::providers::skill_unavailable_reason(
+                        &skill.requires_providers,
+                        &online,
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        let bridge_status = Self::bridge_status_for(config.bridge.clone());
+        let plugins = extensions
+            .plugins
+            .list()
+            .iter()
+            .map(|plugin| {
+                json!({
+                    "manifest":{"id":plugin.manifest.id,"name":plugin.manifest.name,"version":plugin.manifest.version,"description":plugin.manifest.description},
+                    "status":plugin.state,
+                    "error":plugin.error.as_ref().map(|_|"插件加载失败，请检查配置"),
+                    "configuredEnabled":config.plugin_enabled(&plugin.manifest.id),
+                    // 随产品提供的插件不能移除。
+                    "host":crate::extension::providers::is_host_provider(&plugin.manifest.id),
+                    "bundled":crate::extension::providers::is_bundled_plugin(&plugin.manifest.id)
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(
+            json!({"permission":permission,"configPath":self.config_path.display().to_string(),"models":models,"skills":skills,"plugins":plugins,"tools":extensions.tools.definitions().into_iter().chain(self.supervisor.native_plugin_tool_definitions()).collect::<Vec<_>>(),"runtimeToolLabels":self.supervisor.runtime_tool_labels(),"conversations":self.supervisor.journal.conversations()?,"tasks":self.supervisor.journal.list()?.iter().map(crate::runtime::types::public_run).collect::<Vec<_>>(),"strategies":self.supervisor.journal.strategies()?,"workflows":self.supervisor.task_summaries(None)?,"operations":self.operations.store.list()?,"resources":self.operations.store.resources()?,"diagnostics":self.operations.store.diagnostics()?,"notifications":self.operations.store.notifications(true)?,"conversationGroups":self.supervisor.journal.conversation_groups()?,"bridge":bridge_status}),
+        )
+    }
+
+    fn reload_extensions(&self) -> Result<()> {
+        let config = AppConfig::load(&self.config_path)?;
+        let config_dir = config_directory(&self.config_path);
+        let mut skills = SkillRegistry::default();
+        skills.load(&skill_directories(&config, &config_dir))?;
+        for text in crate::extension::skills::EMBEDDED_SKILLS {
+            skills.load_embedded(text)?;
+        }
+        let mut tools = ToolRegistry::default();
+        let mut plugins = PluginManager::default();
+        self.scheduler
+            .configure(config.plugin_enabled("windows-scheduler"))?;
+        plugins.provide_mcp("windows-scheduler", self.scheduler.server()?);
+        let bridge = Arc::new(BgiClient::new(config.bridge.clone()));
+        plugins.provide_mcp(
+            "bgi",
+            crate::bridge::mcp::server(bridge.clone(), config.bridge.enabled)?,
+        );
+        plugins.load(
+            &config.plugins.directories,
+            &config.plugins.enabled,
+            &config.plugins.disabled,
+            &mut tools,
+            &mut skills,
+        )?;
+        let skills = Arc::new(skills);
+        let plugins = Arc::new(plugins);
+        register_builtin_tools(
+            &mut tools,
+            plugins.clone(),
+            Arc::new(crate::runtime::workspace::Workspace::from_config(
+                &self.config_path,
+                (config.host_plugin_enabled() && config.bridge.enabled).then(|| bridge.clone()),
+            )),
+        )?;
+        let tools = Arc::new(tools);
+        self.operations
+            .configure_file_brokers(plugins.broker_specs())?;
+        self.operations.configure_verifiers(plugins.adapters());
+        self.supervisor.update_extensions(
+            skills.clone(),
+            tools.clone(),
+            plugins.adapters().to_vec(),
+        );
+        *self.extensions.write().unwrap() = Extensions {
+            skills,
+            plugins,
+            tools,
+        };
+        Ok(())
+    }
+    fn list_models(&self, params: &Value) -> Result<Value> {
+        let protocol: ModelProtocol = serde_json::from_value(params["protocol"].clone())
+            .map_err(|_| Error::Config("未知的模型协议".into()))?;
+        let auth = params
+            .get("auth")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or(ModelAuth::Auto);
+        let mut api_key = params["apiKey"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if api_key.is_none()
+            && let Some(id) = params["id"].as_str().filter(|id| !id.is_empty())
+        {
+            api_key = self
+                .config
+                .lock()
+                .expect("config mutex poisoned")
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .and_then(|model| model.api_key.clone());
+        }
+        let config = ModelConfig {
+            id: "probe".into(),
+            name: "probe".into(),
+            protocol,
+            model: String::new(),
+            base_url: params["baseUrl"].as_str().unwrap_or("").to_string(),
+            api_key,
+            auth,
+            headers: HashMap::new(),
+            options: ModelOptions::default(),
+        };
+        let models = list_remote_models(&config, params["modelsUrl"].as_str())?;
+        Ok(serde_json::to_value(models)?)
+    }
+
+    fn use_model(&self, model_id: &str) -> Result<Value> {
+        AppConfig::set_active(&self.config_path, model_id)?;
+        self.reload_runtime()?;
+        Ok(json!({"activeModel":model_id}))
+    }
+
+    fn delete_model(&self, id: &str) -> Result<Value> {
+        let active = AppConfig::delete_model(&self.config_path, id)?;
+        self.reload_runtime()?;
+        self.ensure_conversation_models()?;
+        Ok(json!({"deleted":true,"activeModel":active}))
+    }
+
+    fn ensure_conversation_models(&self) -> Result<()> {
+        let (ids, default) = {
+            let config = self.config.lock().expect("config mutex poisoned");
+            (
+                config
+                    .models
+                    .iter()
+                    .map(|model| model.id.clone())
+                    .collect::<Vec<_>>(),
+                config.active_model.clone(),
+            )
+        };
+        self.supervisor.journal.rebind_models(&ids, &default)
+    }
+
+    fn reload_runtime(&self) -> Result<()> {
+        let config = AppConfig::load(&self.config_path)?;
+        self.supervisor.update_config(config.clone())?;
+        *self.config.lock().expect("config mutex poisoned") = config;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bridge_auto_start_tests {
+    use super::*;
+
+    #[test]
+    fn auto_start_preferences_persist_and_keep_connection_settings() {
+        let root = crate::test_root("bridge-auto-start");
+        let path = root.join("config.json");
+        crate::config::seed(&path).unwrap();
+        let mut bridge = AppConfig::load(&path).unwrap().bridge;
+        assert!(!bridge.auto_start);
+        bridge.enabled = false;
+        bridge.host_install_path = Some(PathBuf::from("remembered-bgi"));
+        AppConfig::set_bridge(&path, &bridge).unwrap();
+        let controller = Arc::new(AppController::load(&path).unwrap());
+        for (auto_start, silently) in [(true, false), (true, true), (false, true)] {
+            let result = controller
+                .handle(
+                    "bridge.setLaunchBehavior",
+                    json!({"autoStart":auto_start,"launchSilently":silently}),
+                    Arc::new(|_, _| {}),
+                )
+                .unwrap();
+            assert_eq!(result["autoStart"], auto_start);
+            let saved = AppConfig::load(&path).unwrap().bridge;
+            assert_eq!(saved.auto_start, auto_start);
+            assert_eq!(saved.launch_silently, silently);
+            assert_eq!(saved.host_install_path, bridge.host_install_path);
+            assert!(!saved.enabled);
+            assert_eq!(controller.bridge_status()["autoStart"], auto_start);
+        }
+        assert!(
+            controller
+                .handle(
+                    "bridge.setLaunchBehavior",
+                    json!({"autoStart":true,"launchSilently":"invalid"}),
+                    Arc::new(|_, _| {})
+                )
+                .is_err()
+        );
+        assert!(!AppConfig::load(&path).unwrap().bridge.auto_start);
+        controller.shutdown();
+    }
+}
+
+/// 配置里所有相对路径的基准，也是用户自己的技能与插件所在的目录。
+fn config_directory(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// 配置里列出的技能目录及其归属。
+fn skill_directories(
+    config: &AppConfig,
+    config_dir: &Path,
+) -> Vec<(PathBuf, crate::extension::skills::SkillSource)> {
+    config
+        .agent
+        .skill_directories
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                crate::config::skill_directory_source(config_dir, path),
+            )
+        })
+        .collect()
+}
+
+fn required<'a>(params: &'a Value, field: &str) -> Result<&'a str> {
+    params[field]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Config(format!("{field} is required")))
+}
+
+fn register_builtin_tools(
+    registry: &mut ToolRegistry,
+    plugins: Arc<PluginManager>,
+    workspace: Arc<crate::runtime::workspace::Workspace>,
+) -> Result<()> {
+    let core_read = || ToolExecution {
+        deferred: false,
+        always_load: true,
+        ..ToolExecution::read_only()
+    };
+    registry.register(
+        FunctionTool::new(
+            "plugins.list",
+            "仅在任务明确涉及扩展时列出已安装插件及启用状态。",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+            "core:plugins",
+            move |_| Ok(plugins.public_list()),
+        )
+        .with_label("读取插件列表")
+        .with_execution(core_read()),
+    )?;
+    crate::runtime::workspace::register_tools(registry, workspace)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod question_rpc_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn startup_recovery_finishes_before_accepting_new_runs() {
+        use crate::runtime::{store::journal::Journal, types::RunState};
+        let root = crate::test_root("startup-recovery");
+        let config_path = root.join("config.json");
+        crate::config::seed(&config_path).unwrap();
+        let config = AppConfig::load(&config_path).unwrap();
+        let journal = Journal::open(&config.storage.database).unwrap();
+        let mut interrupted = journal.create("旧请求", "old", "old", 3600, None).unwrap();
+        for state in [
+            RunState::Preflighting,
+            RunState::Deciding,
+            RunState::AwaitingUser,
+        ] {
+            journal.save(&mut interrupted, state).unwrap();
+        }
+        drop(journal);
+        let controller = AppController::load(&config_path).unwrap();
+        assert_eq!(
+            controller
+                .supervisor
+                .journal
+                .get(&interrupted.id)
+                .unwrap()
+                .state,
+            RunState::NeedsReview
+        );
+        let mut fresh = controller
+            .supervisor
+            .journal
+            .create("新请求", "fresh", "fresh", 3600, None)
+            .unwrap();
+        for state in [
+            RunState::Preflighting,
+            RunState::Deciding,
+            RunState::AwaitingUser,
+        ] {
+            controller
+                .supervisor
+                .journal
+                .save(&mut fresh, state)
+                .unwrap();
+        }
+        assert_eq!(
+            controller.supervisor.journal.get(&fresh.id).unwrap().state,
+            RunState::AwaitingUser
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn memory_switch_rpc_preserves_configuration_and_survives_restart() {
+        let root = crate::test_root("memory-setting-rpc");
+        let path = root.join("config.json");
+        crate::config::seed(&path).unwrap();
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["bridge"]["enabled"] = json!(false);
+        config["runtime"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memoryEnabled");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let controller = Arc::new(AppController::load(&path).unwrap());
+        assert_eq!(
+            controller
+                .handle("memory.state", json!({}), Arc::new(|_, _| {}))
+                .unwrap()["enabled"],
+            true
+        );
+        let before: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            controller
+                .handle(
+                    "memory.setEnabled",
+                    json!({"enabled":"false"}),
+                    Arc::new(|_, _| {})
+                )
+                .is_err()
+        );
+        controller
+            .handle(
+                "memory.setEnabled",
+                json!({"enabled":false}),
+                Arc::new(|_, _| {}),
+            )
+            .unwrap();
+        let mut after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["runtime"]["memoryEnabled"], false);
+        after["runtime"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memoryEnabled");
+        assert_eq!(
+            after, before,
+            "Changing memory must preserve model, plugin and permission configuration"
+        );
+        assert!(!controller.supervisor.memory_enabled());
+        assert_eq!(
+            controller
+                .handle("memory.list", json!({}), Arc::new(|_, _| {}))
+                .unwrap()["entries"],
+            json!([])
+        );
+        controller.shutdown();
+        drop(controller);
+        let reopened = Arc::new(AppController::load(&path).unwrap());
+        assert_eq!(
+            reopened
+                .handle("memory.state", json!({}), Arc::new(|_, _| {}))
+                .unwrap()["enabled"],
+            false
+        );
+        reopened
+            .handle(
+                "memory.setEnabled",
+                json!({"enabled":true}),
+                Arc::new(|_, _| {}),
+            )
+            .unwrap();
+        assert!(reopened.supervisor.memory_enabled());
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn conversation_snapshot_and_answer_rpc_roundtrip() {
+        let root = crate::test_root("app-question-rpc");
+        let config_path = root.join("config.json");
+        crate::config::seed(&config_path).unwrap();
+        let controller = Arc::new(AppController::load(&config_path).unwrap());
+        // 直接经真实 Journal 造一个等待回答的运行，再走 RPC 全链路。
+        let mut run = controller
+            .supervisor
+            .journal
+            .create("测试目标", "c-rpc", "key-rpc", 3600, None)
+            .unwrap();
+        for next in [
+            crate::runtime::types::RunState::Preflighting,
+            crate::runtime::types::RunState::Deciding,
+            crate::runtime::types::RunState::AwaitingUser,
+        ] {
+            controller.supervisor.journal.save(&mut run, next).unwrap();
+        }
+        let request = json!({"requestId":"call-rpc","questions":[
+            {"id":"mode","header":"运行方式","question":"怎么跑？"}
+        ]});
+        controller
+            .supervisor
+            .journal
+            .open_question_request(
+                &run,
+                "call-rpc",
+                &request,
+                &json!({"question":"怎么跑？","request":request}),
+            )
+            .unwrap();
+
+        // 快照 RPC：questionRequests 含 open 请求。
+        let snapshot = controller
+            .handle(
+                "conversation.get",
+                json!({"id":"c-rpc"}),
+                Arc::new(|_, _| {}),
+            )
+            .unwrap();
+        let open = snapshot["questionRequests"].as_array().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0]["requestId"], json!("call-rpc"));
+        assert_eq!(open[0]["runId"], json!(run.id));
+        assert_eq!(open[0]["questions"][0]["id"], json!("mode"));
+
+        // 答复 RPC：接收、幂等重放、换答案拒绝、内容非法拒绝。
+        let answer = json!({"id":run.id,"requestId":"call-rpc","answers":{"mode":{"answers":[" 启动 "]}},"clientKey":"client-rpc"});
+        let first = controller
+            .handle("run.question.answer", answer.clone(), Arc::new(|_, _| {}))
+            .unwrap();
+        assert_eq!(first["recorded"], json!(true));
+        let retry = controller.handle("run.question.answer", json!({"id":run.id,"requestId":"call-rpc","answers":{"mode":{"answers":["启动"]}},"clientKey":"client-rpc"}), Arc::new(|_, _| {})).unwrap();
+        assert_eq!(retry["recorded"], json!(false));
+        assert!(controller
+            .handle("run.question.answer", json!({"id":run.id,"requestId":"call-rpc","answers":{"mode":{"answers":["检查"]}},"clientKey":"client-rpc"}), Arc::new(|_, _| {}))
+            .is_err());
+        assert!(controller
+            .handle("run.question.answer", json!({"id":run.id,"requestId":"call-rpc","answers":{"mode":{"answers":[" "]},"x":{"answers":["y"]}}}), Arc::new(|_, _| {}))
+            .is_err());
+        // 答复后快照清空；普通补充仍可照常提交并消费。
+        let snapshot = controller
+            .handle(
+                "conversation.get",
+                json!({"id":"c-rpc"}),
+                Arc::new(|_, _| {}),
+            )
+            .unwrap();
+        assert!(snapshot["questionRequests"].as_array().unwrap().is_empty());
+        controller
+            .handle(
+                "run.input",
+                json!({"id":run.id,"content":"补充说明","clientKey":"s-rpc"}),
+                Arc::new(|_, _| {}),
+            )
+            .unwrap();
+        assert_eq!(
+            controller.supervisor.journal.drain_inputs(&run.id).unwrap(),
+            vec!["补充说明".to_string()]
+        );
+        controller.shutdown();
+        let _ = Value::Null;
+    }
+}

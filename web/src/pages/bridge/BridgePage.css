@@ -1,0 +1,155 @@
+.bridge-page {
+  width: min(100%, 780px);
+  align-content: start;
+  gap: 22px;
+}
+
+.bridge-overview {
+  text-align: left;
+}
+
+.bridge-overview h2 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 650;
+}
+
+.bridge-connection-card,
+.bridge-preferences,
+.bridge-feature {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.bridge-preferences {
+  padding: 0 16px;
+}
+
+.bridge-preferences .setting-row {
+  border-bottom: 0;
+}
+
+.bridge-connection-card {
+  overflow: hidden;
+}
+
+.bridge-connection-row,
+.bridge-endpoint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+}
+
+.bridge-connection-row > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.bridge-connection-row strong {
+  font-size: var(--font-body);
+  font-weight: 600;
+}
+
+.bridge-connection-row span,
+.bridge-endpoint span {
+  color: var(--muted);
+  font-size: var(--font-meta);
+}
+
+.bridge-endpoint {
+  border-top: 1px solid var(--border);
+  background: var(--subtle);
+}
+
+.bridge-endpoint code {
+  color: var(--secondary);
+  font:
+    var(--font-meta)/1.6 "Cascadia Code",
+    Consolas,
+    monospace;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.bridge-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.bridge-feature {
+  display: grid;
+  grid-template-columns: 21px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+  text-align: left;
+}
+
+.bridge-feature:hover {
+  background: var(--hover);
+}
+
+.bridge-feature:disabled {
+  color: var(--muted);
+  background: var(--subtle);
+}
+
+.bridge-feature:disabled:hover {
+  background: var(--subtle);
+}
+
+.bridge-feature:disabled strong,
+.bridge-feature:disabled small {
+  color: var(--muted);
+}
+
+.bridge-feature:disabled > svg:first-child,
+.bridge-feature:disabled > svg:last-child {
+  stroke: var(--muted);
+}
+
+.bridge-feature > svg:first-child {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: var(--secondary);
+  stroke-width: 1.5;
+}
+
+.bridge-feature > svg:last-child {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.6;
+  transform: rotate(180deg);
+}
+
+.bridge-feature > span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.bridge-feature strong {
+  font-size: var(--font-body);
+  font-weight: 600;
+}
+
+.bridge-feature small {
+  color: var(--muted);
+  font-size: var(--font-meta);
+  line-height: 1.5;
+}
+
+@media (max-width: 700px) {
+  .bridge-feature-grid {
+    grid-template-columns: 1fr;
+  }
+}

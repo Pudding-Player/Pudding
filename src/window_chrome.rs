@@ -1,0 +1,350 @@
+//! 自绘标题栏所需的窗口改造：拿掉系统标题栏与边框，接住命中测试，并按系统能力加上圆角。
+//!
+//! 属于桌面壳（`pudding.exe`）而不属于库：只有它需要知道窗口的存在。
+//!
+//! 圆角交给 DWM：Windows 11 会切出平滑圆角；Windows 10 没有这个属性，窗口
+//! 保持方角。
+
+#[cfg(not(target_os = "windows"))]
+use tao::window::Window;
+
+/// 界面可以请求的窗口动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Drag,
+    Minimize,
+    ToggleMaximize,
+    Close,
+}
+
+impl Action {
+    /// IPC 方法名到动作的映射；`None` 表示这不是窗口控制请求。
+    pub fn from_method(method: &str) -> Option<Self> {
+        // 自绘标题栏只存在于 Windows 桌面壳，其它平台上界面不会发出这些请求。
+        if !cfg!(target_os = "windows") {
+            return None;
+        }
+        match method {
+            "window.drag" => Some(Self::Drag),
+            "window.minimize" => Some(Self::Minimize),
+            "window.toggleMaximize" => Some(Self::ToggleMaximize),
+            "window.close" => Some(Self::Close),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn install(_window: &Window) {}
+
+#[cfg(not(target_os = "windows"))]
+pub fn perform(_window: &Window, _action: Action) {}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_drag_strip(_height: f64, _controls_width: f64, _can_maximize: bool) {}
+
+#[cfg(not(target_os = "windows"))]
+pub fn begin_system_drag(_hwnd: isize) {}
+
+#[cfg(not(target_os = "windows"))]
+pub fn begin_system_resize(_hwnd: isize, _direction: &str) {}
+
+/// 窗口句柄的数值形态，跨平台外壳都能拿到一个可传递的值。
+#[cfg(target_os = "windows")]
+pub fn hwnd_id(window: &tao::window::Window) -> isize {
+    use tao::platform::windows::WindowExtWindows;
+    window.hwnd()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn hwnd_id(_window: &tao::window::Window) -> isize {
+    0
+}
+
+#[cfg(target_os = "windows")]
+pub use platform::{begin_system_drag, begin_system_resize, install, perform, set_drag_strip};
+
+#[cfg(target_os = "windows")]
+mod platform {
+    use std::{
+        ptr,
+        sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    };
+
+    use tao::{platform::windows::WindowExtWindows, window::Window};
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
+        UI::{
+            HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
+            Input::KeyboardAndMouse::ReleaseCapture,
+            WindowsAndMessaging::{
+                GWL_STYLE, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT,
+                HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+                IsZoomed, NCCALCSIZE_PARAMS, PostMessageW, SM_CXFRAME, SM_CXPADDEDBORDER,
+                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+                SetWindowLongPtrW, SetWindowPos, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
+                WM_NCLBUTTONDOWN, WS_THICKFRAME,
+            },
+        },
+    };
+
+    use super::Action;
+
+    /// 自绘标题栏的可拖动条带，由界面在挂载后经 `set_drag_strip` 上报，单位是 CSS 像素。
+    /// 高度为 0 表示还没有上报（页面刚启动），此时拖动退回界面发起的 `Action::Drag`。
+    static STRIP_HEIGHT: AtomicU32 = AtomicU32::new(0);
+    /// 标题栏右侧控制按钮组的宽度，条带要让出这段区域。
+    static CONTROLS_WIDTH: AtomicU32 = AtomicU32::new(0);
+    /// 上报条带时声明的最大化能力。
+    static CAN_MAXIMIZE: AtomicBool = AtomicBool::new(true);
+
+    /// 子类化标识，取值只需彼此不同。
+    const PARENT_SUBCLASS: usize = 1;
+
+    // comctl32 的子类化接口，windows-sys 没有导出。wry 在同一个父窗口上也用
+    // 这一套（WebView2 靠它跟随窗口尺寸），两边走同一条链才能并存。
+    type SubclassProc =
+        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
+
+    #[link(name = "comctl32")]
+    unsafe extern "system" {
+        fn SetWindowSubclass(
+            hwnd: HWND,
+            procedure: Option<SubclassProc>,
+            id: usize,
+            data: usize,
+        ) -> i32;
+        fn DefSubclassProc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+    }
+
+    /// 请求 DWM 画圆角。Windows 11 接受并切出平滑圆角；Windows 10 不认识这个
+    /// 属性，窗口保持方角。
+    pub fn apply_rounding(hwnd: HWND) {
+        let preference = DWMWCP_ROUND;
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                ptr::from_ref(&preference).cast(),
+                size_of::<i32>() as u32,
+            );
+        }
+    }
+
+    /// 界面挂载标题栏后上报可拖动条带的几何信息（CSS 像素）。上报之后条带区域
+    /// 由原生命中测试答 HTCAPTION。
+    pub fn set_drag_strip(height: f64, controls_width: f64, can_maximize: bool) {
+        if height >= 0.0 && controls_width >= 0.0 {
+            STRIP_HEIGHT.store(height as u32, Ordering::Relaxed);
+            CONTROLS_WIDTH.store(controls_width as u32, Ordering::Relaxed);
+            CAN_MAXIMIZE.store(can_maximize, Ordering::Relaxed);
+        }
+    }
+
+    /// 安装无边框窗口行为，保留原窗口的缩放能力。
+    pub fn install(window: &Window) {
+        let hwnd = window.hwnd() as HWND;
+        unsafe {
+            // 子类先装上：下面加回 WS_THICKFRAME 会让系统重算非客户区，那一次
+            // WM_NCCALCSIZE 要由本模块接手。
+            SetWindowSubclass(hwnd, Some(parent_proc), PARENT_SUBCLASS, 0);
+
+            // 无装饰的窗口没有 WS_THICKFRAME，而缩放循环、贴边吸附、拖离最大化都挂在它上面。
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            let style = if window.is_resizable() {
+                style | WS_THICKFRAME
+            } else {
+                style & !WS_THICKFRAME
+            };
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+
+            apply_rounding(hwnd);
+        }
+    }
+
+    /// 执行窗口动作。`Close` 不在这里处理：隐藏到托盘还是退出进程由外壳决定。
+    pub fn perform(window: &Window, action: Action) {
+        match action {
+            Action::Drag => begin_system_drag(window.hwnd()),
+            Action::Minimize => window.set_minimized(true),
+            Action::ToggleMaximize => window.set_maximized(!window.is_maximized()),
+            Action::Close => {}
+        }
+    }
+
+    /// 回调返回后进入系统移动循环，避免在 WebView2 回调内启动嵌套消息循环。
+    pub fn begin_system_drag(hwnd: isize) {
+        unsafe {
+            let mut point = POINT::default();
+            if GetCursorPos(&mut point) == 0 {
+                return;
+            }
+            let position =
+                (((point.y as u32 & 0xFFFF) << 16) | (point.x as u32 & 0xFFFF)) as LPARAM;
+            ReleaseCapture();
+            PostMessageW(
+                hwnd as HWND,
+                WM_NCLBUTTONDOWN,
+                HTCAPTION as WPARAM,
+                position,
+            );
+        }
+    }
+
+    /// 从界面边缘进入当前窗口的系统缩放循环。
+    pub fn begin_system_resize(hwnd: isize, direction: &str) {
+        let hit = match direction {
+            "left" => HTLEFT,
+            "right" => HTRIGHT,
+            "top" => HTTOP,
+            "bottom" => HTBOTTOM,
+            "topLeft" => HTTOPLEFT,
+            "topRight" => HTTOPRIGHT,
+            "bottomLeft" => HTBOTTOMLEFT,
+            "bottomRight" => HTBOTTOMRIGHT,
+            _ => return,
+        };
+        let hwnd = hwnd as HWND;
+        unsafe {
+            if IsZoomed(hwnd) != 0 || GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME == 0
+            {
+                return;
+            }
+            let mut point = POINT::default();
+            if GetCursorPos(&mut point) == 0 {
+                return;
+            }
+            let position =
+                (((point.y as u32 & 0xFFFF) << 16) | (point.x as u32 & 0xFFFF)) as LPARAM;
+            ReleaseCapture();
+            PostMessageW(hwnd, WM_NCLBUTTONDOWN, hit as WPARAM, position);
+        }
+    }
+
+    unsafe extern "system" fn parent_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        match message {
+            WM_NCCALCSIZE if wparam != 0 => {
+                // 系统算出的客户区原样退回，非客户区被压成零宽。
+                let params = lparam as *mut NCCALCSIZE_PARAMS;
+                let proposed = unsafe { (*params).rgrc[0] };
+                unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+                unsafe { (*params).rgrc[0] = proposed };
+                if unsafe { IsZoomed(hwnd) } != 0 {
+                    // 最大化时扣除系统外扩到工作区之外的缩放边框。
+                    let frame = unsafe { frame_thickness(hwnd) };
+                    let rect = unsafe { &mut (*params).rgrc[0] };
+                    rect.left += frame;
+                    rect.top += frame;
+                    rect.right -= frame;
+                    rect.bottom -= frame;
+                }
+                0
+            }
+            WM_NCHITTEST => {
+                // 内部区域不返回 HTCAPTION 之外的值：条带是界面自绘的标题栏。
+                let hit = unsafe { resize_hit(hwnd, lparam) };
+                if hit != HTCLIENT as LRESULT {
+                    return hit;
+                }
+                if unsafe { in_drag_strip(hwnd, lparam) } {
+                    return HTCAPTION as LRESULT;
+                }
+                HTCLIENT as LRESULT
+            }
+            WM_NCLBUTTONDBLCLK if wparam as i32 == HTCAPTION as i32 => {
+                // 不能最大化的窗口把双击吞掉；HTCAPTION 的双击最大化/还原是
+                // DefWindowProc 的行为。
+                if CAN_MAXIMIZE.load(Ordering::Relaxed) {
+                    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+                } else {
+                    0
+                }
+            }
+            _ => unsafe { DefSubclassProc(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    /// 命中点是否落在自绘标题栏的条带里（控制按钮组除外）。条带未上报时恒为否。
+    unsafe fn in_drag_strip(hwnd: HWND, lparam: LPARAM) -> bool {
+        let strip = STRIP_HEIGHT.load(Ordering::Relaxed);
+        if strip == 0 {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return false;
+        }
+        // 屏幕坐标可以是负数，所以先按无符号取位，再按有符号解释。
+        let x = (lparam & 0xFFFF) as u16 as i16 as i32;
+        let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+        let scale = unsafe { GetDpiForWindow(hwnd) } as f64 / 96.0;
+        let strip_height = strip as f64 * scale;
+        let y = (y - rect.top) as f64;
+        if (0.0..strip_height).contains(&y) {
+            let controls = CONTROLS_WIDTH.load(Ordering::Relaxed) as f64 * scale;
+            let limit = (rect.right - rect.left) as f64 - controls;
+            (x as f64 - rect.left as f64) < limit
+        } else {
+            false
+        }
+    }
+
+    /// 当前窗口边缘窄带的命中测试。
+    unsafe fn resize_hit(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+        if unsafe { IsZoomed(hwnd) } != 0
+            || unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_THICKFRAME == 0
+        {
+            return HTCLIENT as LRESULT;
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return HTCLIENT as LRESULT;
+        }
+        // 屏幕坐标可以是负数，所以先按无符号取位，再按有符号解释。
+        let x = (lparam & 0xFFFF) as u16 as i16 as i32;
+        let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+        let frame = unsafe { frame_thickness(hwnd) };
+        let code = match (
+            x < rect.left + frame,
+            x >= rect.right - frame,
+            y < rect.top + frame,
+            y >= rect.bottom - frame,
+        ) {
+            (true, _, true, _) => HTTOPLEFT,
+            (_, true, true, _) => HTTOPRIGHT,
+            (true, _, _, true) => HTBOTTOMLEFT,
+            (_, true, _, true) => HTBOTTOMRIGHT,
+            (true, _, _, _) => HTLEFT,
+            (_, true, _, _) => HTRIGHT,
+            (_, _, true, _) => HTTOP,
+            (_, _, _, true) => HTBOTTOM,
+            _ => HTCLIENT,
+        };
+        code as LRESULT
+    }
+
+    /// 系统认定的边框宽度。
+    unsafe fn frame_thickness(hwnd: HWND) -> i32 {
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        unsafe {
+            GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+        }
+    }
+}
