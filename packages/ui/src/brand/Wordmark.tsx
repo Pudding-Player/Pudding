@@ -1,15 +1,16 @@
-import markup from "./wordmark.svg?raw";
-import { SvgAsset } from "./SvgAsset";
+import wordmark from "./wordmark.png";
 import "./Wordmark.css";
 
 type IconProps = { className?: string };
 
-/** 产品字标。图形在 `wordmark.svg`，可直接打开。 */
+/** 产品字标：插画风 Pudding 全名。全尺寸源图在 video/output/pudding-brand/（本地），
+ * 此处为 256px 高使用副本。 */
 export function Wordmark({ className }: IconProps) {
   return (
-    <SvgAsset
-      markup={markup}
-      idPrefix="brand-wordmark-"
+    <img
+      src={wordmark}
+      alt="Pudding"
+      draggable={false}
       className={className ?? "app-wordmark"}
     />
   );
