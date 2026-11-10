@@ -102,6 +102,12 @@ fn validate_release(release: &Release, channel: &str) -> Result<()> {
     validate_channel(&release.version, channel)?;
     let url =
         url::Url::parse(&release.url).map_err(|_| Error::Config("更新地址格式不正确".into()))?;
+    let installer_paths = ["Pudding", "Sleepy-Doll"].map(|product| {
+        format!(
+            "/releases/{}/{product}-{}-setup.exe",
+            release.version, release.version
+        )
+    });
     if release.channel != channel
         || url.scheme() != "https"
         || url.host_str() != Some(DOWNLOAD_HOST)
@@ -110,11 +116,7 @@ fn validate_release(release: &Release, channel: &str) -> Result<()> {
         || url.port().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || url.path()
-            != format!(
-                "/releases/{}/Pudding-{}-setup.exe",
-                release.version, release.version
-            )
+        || !installer_paths.iter().any(|path| url.path() == path)
         || release.size == 0
         || release.size > MAX_INSTALLER
         || release.sha256.len() != 64
@@ -451,6 +453,10 @@ mod tests {
         };
         assert!(validate_release(&release, "stable").is_ok());
         assert!(validate_release(&release, "test").is_err());
+        release.url = format!("https://{DOWNLOAD_HOST}/releases/0.1.0/Sleepy-Doll-0.1.0-setup.exe");
+        assert!(validate_release(&release, "stable").is_ok());
+        release.url = format!("https://{DOWNLOAD_HOST}/releases/0.1.0/Sleepy-Doll-0.2.0-setup.exe");
+        assert!(validate_release(&release, "stable").is_err());
         release.url = "https://example.com/installer.exe".into();
         assert!(validate_release(&release, "stable").is_err());
     }
