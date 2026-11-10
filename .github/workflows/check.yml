@@ -45,11 +45,24 @@ jobs:
         run: dotnet run --project bridges/bgi/bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --data-migration
       - name: Validate workspace PowerShell execution
         run: cargo test --no-default-features --lib runtime::workspace::tests::shell_ -- --nocapture
+      - name: Validate BGI interface contracts
+        run: dotnet run --project bridges/bgi/bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --check-interfaces bridges/bgi/bgi-bridge/dev/bgi-method-metadata.json
       - name: Validate BGI progressive disclosure
+        run: python bridges/bgi/bgi-bridge/dev/feature-guide-builder.py --check
+      - name: Validate Rust library tests
         run: |
-          dotnet run --project bridges/bgi/bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --check-interfaces bridges/bgi/bgi-bridge/dev/bgi-method-metadata.json
-          python bridges/bgi/bgi-bridge/dev/feature-guide-builder.py --check
-          cargo test --no-default-features --lib
+          # 子进程可能输出 CLIXML；不要让 PowerShell 将 Rust 的原生错误流当作 XML 解析。
+          & cmd.exe /d /c "cargo test --no-default-features --lib > target/tmp/rust-library-tests.log 2>&1"
+          $result = $LASTEXITCODE
+          $lines = Get-Content -LiteralPath target/tmp/rust-library-tests.log
+          $lines | Write-Output
+          if ($result -ne 0) {
+            foreach ($line in ($lines | Select-String -Pattern 'FAILED|panicked at|^error:|^test result:')) {
+              $message = $line.ToString().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Output "::error::$message"
+            }
+          }
+          exit $result
       - name: Build assembled installer
         run: npm run dist
       - uses: actions/upload-artifact@v4
