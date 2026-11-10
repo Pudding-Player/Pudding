@@ -47,6 +47,8 @@
 Windows 构建需要 Rust stable、Node.js 22.18+、.NET 8 SDK 和 Visual Studio 2022 C++ Build Tools；主程序运行需要 WebView2 Runtime。
 
 ```powershell
+git clone https://github.com/Pudding-Player/Pudding.git
+cd Pudding
 npm run bridges:fetch
 npm ci
 npm run dist
