@@ -136,7 +136,7 @@ try {
   if (options.some(option => option !== '--locked')) throw Error('Only --locked is supported');
   if (action === 'status') {
     for (const bridge of lock.bridges) console.log(JSON.stringify({ id: bridge.id, path: bridge.path, pinned: bridge.revision, ...inspect(bridge) }));
-  } else if (action === 'fetch') {
+  } else if (action === 'fetch' || action === 'ensure') {
     for (const bridge of lock.bridges) { const state = ensure(bridge); console.log(`${bridge.id}: ${state.revision}${state.dirty ? ' (local changes preserved)' : ''}`); }
   } else if (action === 'lock') {
     for (const bridge of lock.bridges) {

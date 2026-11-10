@@ -25,7 +25,7 @@ if errorlevel 1 (
 )
 for /f "tokens=2 delims== " %%V in ('findstr /b /c:"version = " Cargo.toml') do set "VERSION=%%~V"
 if not defined VERSION exit /b 1
-node scripts\bridges.mjs fetch
+node scripts\bridges.mjs ensure
 if errorlevel 1 exit /b 1
 if not exist node_modules call npm ci
 if errorlevel 1 exit /b 1
