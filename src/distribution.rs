@@ -443,7 +443,7 @@ mod tests {
         let mut release = Release {
             version: "0.1.0".into(),
             channel: "stable".into(),
-            url: format!("https://{DOWNLOAD_HOST}/releases/0.1.0/Sleepy-Doll-0.1.0-setup.exe"),
+            url: format!("https://{DOWNLOAD_HOST}/releases/0.1.0/Pudding-0.1.0-setup.exe"),
             size: 7_000_000,
             sha256: "a".repeat(64),
             notes: String::new(),
@@ -461,7 +461,7 @@ mod tests {
             version: "0.2.0-alpha.10".into(),
             channel: "test".into(),
             url: format!(
-                "https://{DOWNLOAD_HOST}/releases/0.2.0-alpha.10/Sleepy-Doll-0.2.0-alpha.10-setup.exe"
+                "https://{DOWNLOAD_HOST}/releases/0.2.0-alpha.10/Pudding-0.2.0-alpha.10-setup.exe"
             ),
             size: 7_000_000,
             sha256: "a".repeat(64),
