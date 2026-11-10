@@ -124,7 +124,8 @@ mod tests {
     }
 
     pub(super) fn wait(child: &mut std::process::Child) {
-        let deadline = Instant::now() + Duration::from_secs(12);
+        // 清理器允许重试 60 秒；另留 30 秒给 Windows PowerShell 首次模块初始化。
+        let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success(), "cleanup helper failed: {status}");

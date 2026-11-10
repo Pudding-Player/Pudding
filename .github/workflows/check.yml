@@ -52,7 +52,7 @@ jobs:
       - name: Validate Rust library tests
         run: |
           # 子进程可能输出 CLIXML；不要让 PowerShell 将 Rust 的原生错误流当作 XML 解析。
-          & cmd.exe /d /c "cargo test --no-default-features --lib > target/tmp/rust-library-tests.log 2>&1"
+          & cmd.exe /d /c "cargo test --no-default-features --lib -- --test-threads=2 > target/tmp/rust-library-tests.log 2>&1"
           $result = $LASTEXITCODE
           $lines = Get-Content -LiteralPath target/tmp/rust-library-tests.log
           $lines | Write-Output
