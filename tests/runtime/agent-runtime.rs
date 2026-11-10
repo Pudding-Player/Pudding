@@ -2784,3 +2784,6 @@ mod search_batch_live;
 
 #[path = "local-adapters-live.rs"]
 mod local_adapters_live;
+
+#[path = "bgi-clr-gap-live.rs"]
+mod bgi_clr_gap_live;

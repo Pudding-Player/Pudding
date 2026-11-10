@@ -1,4 +1,5 @@
 # Build, delivery and validation output
+/bridges/
 node_modules/
 /target/
 /dist/

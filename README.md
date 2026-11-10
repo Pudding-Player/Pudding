@@ -9,13 +9,14 @@
 Windows 构建需要 Rust stable、Node.js 22.18+、.NET 8 SDK 和 Visual Studio 2022 C++ Build Tools。主程序运行需要 WebView2 Runtime；安装器使用 Slint 原生界面，可在缺少 WebView2 时启动并补装运行时。
 
 ```powershell
-npm install
+npm run bridges:fetch
+npm ci
 npm run dist
 ```
 
 完整构建在 `dist/` 生成当前版本安装包、SHA-256 校验文件和本地构建清单。组包暂存与内嵌载荷位于 `target/setup/`，构建结束后自动清理。`npm run desktop` 在 `target/dev/desktop/` 组装并启动开发程序，用户数据不进入交付目录。目录规范见 [AGENTS.md](AGENTS.md)。
 
-Web 与安卓组件库作为仓库内部模块维护。Moduloom 预览工具是本地可选依赖，正常安装和 GitHub 构建无需它；需要预览时按[开发文档](docs/development.md#浏览器预览)单独安装。
+Web 与安卓组件库继续作为仓库内部 monorepo 模块维护。四套桥独立维护，构建入口自动获取锁定源码并组装，详见[仓库与构建链路](docs/repositories.md)。Moduloom 预览工具是本地可选依赖，正常安装和 GitHub 构建无需它；需要预览时按[开发文档](docs/development.md#浏览器预览)单独安装。
 
 安装后启动 Pudding，在设置中添加模型，并在 BetterGI 页面连接工具。程序启动时请求管理员权限。默认安装目录为固定 D 盘上的 `D:\Pudding`；没有固定 D 盘时使用 `%LOCALAPPDATA%\Programs\Pudding`。
 
@@ -31,7 +32,7 @@ Web 与安卓组件库作为仓库内部模块维护。Moduloom 预览工具是�
 | `android/` | Android 工程与构建入口 |
 | `frame/` | Loom 组件清单、渲染与主题适配 |
 | `plugins/` | 领域技能与工具接入清单 |
-| `bgi-bridge/` | BGI 进程内桥、源码索引与桥专项验证 |
+| `bridges/` | 四个独立桥仓的本地检出，构建入口按锁定提交自动获取 |
 | `scripts/` | 构建、发布、更新验证与缓存清理 |
 | `tests/` | 界面、桌面与通用运行时验证 |
 | `cloudflare/` | 分发服务 |
@@ -52,7 +53,7 @@ Web 与安卓组件库作为仓库内部模块维护。Moduloom 预览工具是�
 - [技能与插件](docs/extensions.md)
 - [快捷任务](docs/quick-tasks.md)
 - [发布与更新](docs/distribution.md)
-- [BGI 桥](bgi-bridge/README.md)、[宿主契约](docs/bgi/host-contracts.md)、[配置恢复](docs/bgi/config-recovery.md)
+- [BGI 桥](bridges/bgi/bgi-bridge/README.md)、[宿主契约](docs/bgi/host-contracts.md)、[配置恢复](docs/bgi/config-recovery.md)
 
 ## 许可
 

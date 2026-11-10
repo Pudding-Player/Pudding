@@ -4,6 +4,7 @@ rem Keep this file ASCII-only: cmd.exe reads the system OEM code page.
 cd /d "%~dp0.."
 set "ROOT=%CD%"
 set "TEMP=%ROOT%\target\tmp"
+if defined PUDDING_BUILD_TMP set "TEMP=%PUDDING_BUILD_TMP%"
 set "TMP=%TEMP%"
 set "TMPDIR=%TEMP%"
 set "NODE_DISABLE_COMPILE_CACHE=1"
@@ -24,11 +25,15 @@ if errorlevel 1 (
 )
 for /f "tokens=2 delims== " %%V in ('findstr /b /c:"version = " Cargo.toml') do set "VERSION=%%~V"
 if not defined VERSION exit /b 1
+node scripts\bridges.mjs fetch
+if errorlevel 1 exit /b 1
+if not exist node_modules call npm ci
+if errorlevel 1 exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package-windows.ps1" -Action Check
 if errorlevel 1 exit /b 1
 
-echo [1/4] Building bridge...
-call bgi-bridge\build.cmd
+echo [1/4] Building independent bridges...
+node scripts\bridges.mjs build
 if errorlevel 1 exit /b 1
 
 echo [2/4] Building interface...

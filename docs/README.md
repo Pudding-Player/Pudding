@@ -5,6 +5,7 @@
 | 目标 | 文档 |
 | --- | --- |
 | 安装、构建和项目介绍 | [项目首页](../README.md) |
+| 仓库拆分、依赖锁定和本地构建 | [仓库与构建链路](repositories.md) |
 | 开发环境、验证命令和生成文件 | [开发与验证](development.md) |
 | 模型、联网、凭据和数据迁移 | [配置与数据](configuration.md) |
 | 当前 Agent、上下文、工具和记忆链路 | [运行内核](internals.md) |
@@ -14,7 +15,7 @@
 | 构建安装包、签名和正式发布 | [发布与更新](distribution.md) |
 | 理解 Agent 与 Harness 的设计取舍 | [Agent 开发教程](guides/agent-development.md) |
 | BGI 当前工具与技能的披露过程 | [渐进式披露](bgi/progressive-disclosure.md) |
-| BGI 桥接入与组件布局 | [桥说明](../bgi-bridge/README.md) |
+| BGI 桥接入与组件布局 | [桥说明](../bridges/bgi/bgi-bridge/README.md) |
 | 宿主调用、互斥与验证边界 | [宿主契约](bgi/host-contracts.md) |
 | 用户设置的备份与恢复 | [配置恢复](bgi/config-recovery.md) |
 | 提交代码、反馈问题和安全报告 | [贡献指南](../CONTRIBUTING.md)、[安全说明](../SECURITY.md) |

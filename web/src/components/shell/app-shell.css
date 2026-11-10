@@ -77,7 +77,7 @@
 }
 .app-sidebar {
   /* 停靠与悬浮用同一层固定侧栏加 translateX 定位。背景顶到窗口上缘，
-     内容仍从标题栏条带下方开始，收起按钮与页首的展开按钮同一高度。 */
+     导航仍从标题栏下方开始，字标可以向上跨入透明的拖动条带。 */
   position: fixed;
   inset: 0 auto 0 0;
   padding-top: var(--title-bar-height);
@@ -92,7 +92,6 @@
   white-space: nowrap;
   transform: translateX(-100%);
   pointer-events: none;
-  transition: transform var(--sidebar-motion);
 }
 .app-shell:not([data-collapsed="true"]) .app-sidebar,
 .app-shell[data-drawer="true"] .app-sidebar {
@@ -115,8 +114,18 @@
 }
 .app-brand .icon-button {
   app-region: no-drag;
+  flex-shrink: 0;
   margin-left: auto;
   color: var(--muted);
+}
+.app-brand .app-wordmark {
+  /* 自绘标题栏占 32px：借用上方空间，品牌行及导航的位置保持不变。 */
+  height: calc(32px + var(--title-bar-height));
+  max-width: calc(100% - 30px - 8px);
+  min-width: 0;
+  flex-shrink: 1;
+  object-fit: contain;
+  transform: translateY(calc(var(--title-bar-height) / -2));
 }
 .app-new {
   margin: 4px var(--sidebar-pad-x) 8px;
@@ -429,14 +438,14 @@
 .app-account-avatar {
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   flex-shrink: 0;
 }
 .app-account-avatar svg,
 .app-account-avatar img {
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   object-fit: contain;
 }
 .app-account-copy {
@@ -545,10 +554,29 @@
   margin-left: var(--sidebar-width);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 0;
   padding: 8px var(--layout-gap) var(--layout-gap);
   overflow: hidden;
-  transition: margin-left var(--sidebar-motion);
+}
+.app-header-slot {
+  display: grid;
+  grid-template-rows: 0fr;
+  flex-shrink: 0;
+  padding-bottom: 0;
+  opacity: 0;
+  transition:
+    grid-template-rows var(--sidebar-motion),
+    padding-bottom var(--sidebar-motion),
+    opacity var(--motion-base) var(--ease-standard);
+}
+.app-header-slot[data-visible="true"] {
+  grid-template-rows: 1fr;
+  padding-bottom: 8px;
+  opacity: 1;
+}
+.app-header-clip {
+  min-height: 0;
+  overflow: hidden;
 }
 .app-header {
   height: var(--header-height);
@@ -588,6 +616,9 @@
 .app-header-fold[data-collapsed="true"] {
   max-width: 72px;
   opacity: 1;
+}
+.app-header-fold .icon-button {
+  flex-shrink: 0;
 }
 .app-header h1 {
   font-size: var(--font-body);
@@ -859,6 +890,11 @@ body[data-theme-reveal-layer="old"]::view-transition-new(root) {
     0 2px 6px #0003;
 }
 @media (prefers-reduced-motion: reduce) {
+  .app-sidebar,
+  .app-header-slot,
+  .app-header-fold {
+    transition: none;
+  }
   .app-account-menu,
   .app-account-menu[data-open="false"] {
     animation: none;

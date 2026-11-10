@@ -84,7 +84,7 @@ PUDDING_CONFIG="$PWD/pudding.dev.config.json" cargo run --release
 | --- | --- |
 | `1` → `2` | 补齐缺失的 `runtime` 段；迁移前留下 `config.v1.backup.json` |
 | `2` → `3` | `permissionMode` 仍是旧默认值 `askEach` 时改为 `standard`。旧默认值是写回文件的产物，不算用户选择；显式选择逐项审批的用户改回 `askEach` 即可，之后不再被覆盖 |
-| `3` → `4` | 去掉产品技能目录（`../skills`），给插件目录补上产品根 `../plugins`——领域说明随 `plugins/bgi` 分发，不再单独列技能目录。用户自己的 `./skills` 与 `./plugins` 不受影响 |
+| `3` → `4` | 去掉产品技能目录（`../skills`），给插件目录补上产品根 `../plugins`——领域说明随 `bridges/bgi/plugins/bgi` 分发，不再单独列技能目录。用户自己的 `./skills` 与 `./plugins` 不受影响 |
 
 ## 模型配置
 

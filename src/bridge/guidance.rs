@@ -18,6 +18,13 @@ pub(crate) fn contract(mut value: Value) -> Value {
         "savingRequiresGameReady":false,
         "note":"methodId 是 BetterGI 接口标识，不是 Agent 工具名。快捷入口使用上述 tool 和参数层级；保存不执行目标，游戏就绪条件只在运行时检查。callable=false 时按 unavailableReason 处理，不推断为连接失败。示例只展示结构，名称、路径、对象引用与版本哈希必须取自本次真实证据。"
     });
+    if id.starts_with("bgi.clr.") {
+        value["agentCall"]["shortcutPrepare"] = json!([]);
+        value["agentCall"]["shortcutEligible"] = json!(false);
+        value["agentCall"]["note"] = json!(
+            "这是本轮缺项补足，不保存快捷／定时入口。成员和计划来自当前已加载的本体类型；预览不执行，调用原方法后按返回范围说明结果，不转向 UI，不因缺少业务回执重复执行。"
+        );
+    }
     value
 }
 

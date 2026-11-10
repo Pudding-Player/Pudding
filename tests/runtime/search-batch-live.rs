@@ -77,7 +77,8 @@ async fn live_glm_search_batches_with_execution_intercept() {
         let mut skills = crate::extension::skills::SkillRegistry::default();
         skills
             .load(&[(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/bgi/skills"),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("bridges/bgi/plugins/bgi/skills"),
                 crate::extension::skills::SkillSource::Plugin("bgi".into()),
             )])
             .unwrap();

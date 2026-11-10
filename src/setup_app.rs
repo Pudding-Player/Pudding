@@ -294,7 +294,10 @@ fn bind(ui: &SetupWindow, ctx: Arc<Mutex<Context>>) {
     let c = ctx.clone();
     ui.on_modal_primary(move || {
         if let Some(ui) = weak.upgrade() {
-            if ui.get_state_id() == "uninstall-blocked" {
+            if matches!(
+                ui.get_state_id().as_str(),
+                "uninstall-blocked" | "update-blocked"
+            ) {
                 c.lock().unwrap().close_blockers = true;
             }
             ui.set_modal_visible(false);
@@ -389,16 +392,36 @@ fn request_close(ui: &SetupWindow) {
 
 fn continue_install(ui: &SetupWindow, ctx: Arc<Mutex<Context>>) {
     let context = ctx.lock().unwrap().clone();
-    if context.uninstall && !context.close_blockers {
-        match open_archive()
-            .and_then(|archive| setup::uninstall::blocking_programs(&archive, &context.directory))
-        {
+    if (context.uninstall || context.update) && !context.close_blockers {
+        let blockers = open_archive().and_then(|archive| {
+            if context.uninstall {
+                setup::uninstall::blocking_programs(&archive, &context.directory)
+            } else {
+                setup::install::blocking_programs(&archive, &context.directory)
+            }
+        });
+        match blockers {
             Ok(owners) if !owners.is_empty() => {
-                ui.set_state_id("uninstall-blocked".into());
-                ui.set_modal_title("关闭占用程序并卸载？".into());
-                ui.set_modal_description("将请求以下程序正常退出，然后自动继续卸载。".into());
+                let operation = if context.uninstall {
+                    "卸载"
+                } else {
+                    "更新"
+                };
+                ui.set_state_id(
+                    if context.uninstall {
+                        "uninstall-blocked"
+                    } else {
+                        "update-blocked"
+                    }
+                    .into(),
+                );
+                ui.set_modal_title(format!("关闭占用程序并{operation}？").into());
+                ui.set_modal_description(
+                    format!("将请求以下程序正常退出，然后自动继续{operation}。请先保存工作。")
+                        .into(),
+                );
                 ui.set_modal_detail(owners.join("\n").into());
-                ui.set_modal_primary_label("关闭并卸载".into());
+                ui.set_modal_primary_label(format!("关闭并{operation}").into());
                 ui.set_modal_cancel_label("取消".into());
                 ui.set_modal_visible(true);
                 return;
@@ -419,7 +442,6 @@ fn continue_install(ui: &SetupWindow, ctx: Arc<Mutex<Context>>) {
 
 fn start(ui: &SetupWindow, ctx: Arc<Mutex<Context>>, runtime_first: bool) {
     let c = ctx.lock().unwrap().clone();
-    ctx.lock().unwrap().close_blockers = false;
     reset(ui, "busy");
     ui.set_busy(true);
     ui.set_primary_enabled(false);
@@ -467,6 +489,8 @@ fn start(ui: &SetupWindow, ctx: Arc<Mutex<Context>>, runtime_first: bool) {
                 return;
             }
         }
+        // 运行组件补装失败时尚未关闭程序，重试应保留本次更新已经取得的确认。
+        ctx.lock().unwrap().close_blockers = false;
         let outcome = if c.repair_runtime {
             Ok(())
         } else {
@@ -496,6 +520,9 @@ fn start(ui: &SetupWindow, ctx: Arc<Mutex<Context>>, runtime_first: bool) {
                     }
                     setup::uninstall(&archive, &c.directory, &mut report)
                 } else if c.update {
+                    if c.close_blockers {
+                        setup::install::close_blocking_programs(&archive, &c.directory)?;
+                    }
                     setup::update(&archive, &c.directory, &mut report)
                 } else {
                     setup::install(&archive, &c.directory, c.shortcut, &mut report)

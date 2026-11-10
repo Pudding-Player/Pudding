@@ -37,6 +37,7 @@ import {
   Wordmark,
 } from "@pudding/ui/icons";
 import { SidebarAccount } from "./SidebarAccount";
+import { useSidebarMotion } from "./sidebar-motion";
 import { TitleBar } from "./TitleBar";
 import { InlineRename } from "@pudding/ui/controls/InlineRename";
 import { DisclosureChevron } from "@pudding/ui/controls/DisclosureChevron";
@@ -184,6 +185,8 @@ export function AppShell({
   const [peek, setPeek] = useState(false);
   const [resizing, setResizing] = useState(false);
   const shell = useRef<HTMLDivElement>(null);
+  const sidebar = useRef<HTMLElement>(null);
+  const main = useRef<HTMLElement>(null);
   const body = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const ghostNode = useRef<HTMLDivElement>(null);
@@ -195,6 +198,7 @@ export function AppShell({
   const resizingRef = useRef(false);
   const resizeCleanup = useRef<(() => void) | null>(null);
   const peekTimer = useRef(0);
+  const peekBlocked = useRef(false);
   const [query, setQuery] = useState("");
   const [layout, setLayout] = useState<GroupLayout>(() => {
     const local = readLayout();
@@ -580,8 +584,19 @@ export function AppShell({
   const docked = wide && !collapsed;
   const overlayOpen = !docked && (peek || !collapsed);
   const sidebarVisible = docked || overlayOpen;
+  useSidebarMotion({
+    shell,
+    sidebar,
+    main,
+    docked,
+    visible: sidebarVisible,
+    width: sidebarWidth,
+    resizing,
+  });
   const showPeek = () => {
+    if (peekBlocked.current) return;
     window.clearTimeout(peekTimer.current);
+    peekTimer.current = 0;
     setPeek(true);
   };
   const hidePeek = (event?: { relatedTarget: EventTarget | null }) => {
@@ -596,10 +611,14 @@ export function AppShell({
       return;
     }
     window.clearTimeout(peekTimer.current);
-    peekTimer.current = window.setTimeout(() => setPeek(false), 220);
+    peekTimer.current = window.setTimeout(() => {
+      peekTimer.current = 0;
+      setPeek(false);
+    }, 220);
   };
   useEffect(() => {
-    if (docked || !peek) return;
+    if (docked) return;
+    const boundary = Math.min(sidebarWidth, viewport * 0.88);
     const onMove = (event: globalThis.PointerEvent) => {
       if (resizingRef.current || draggingRef.current) return;
       const x = event.clientX;
@@ -607,21 +626,34 @@ export function AppShell({
       if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
         return;
       }
-      if (x > sidebarWidth) {
+      if (x > boundary) {
+        peekBlocked.current = false;
+        if (peek && !peekTimer.current) {
+          peekTimer.current = window.setTimeout(() => {
+            peekTimer.current = 0;
+            setPeek(false);
+          }, 220);
+        }
+      } else if (peek) {
         window.clearTimeout(peekTimer.current);
-        setPeek(false);
+        peekTimer.current = 0;
       }
     };
     window.addEventListener("pointermove", onMove);
     return () => window.removeEventListener("pointermove", onMove);
-  }, [docked, peek, sidebarWidth]);
+  }, [docked, peek, sidebarWidth, viewport]);
   const pinSidebar = () => {
     window.clearTimeout(peekTimer.current);
+    peekTimer.current = 0;
+    peekBlocked.current = false;
     setPeek(false);
     setCollapsed(false);
   };
   const foldSidebar = () => {
     window.clearTimeout(peekTimer.current);
+    peekTimer.current = 0;
+    // 收起中的侧栏会从指针下滑过，不能把合成层移动当成再次悬停。
+    peekBlocked.current = true;
     setPeek(false);
     setCollapsed(true);
   };
@@ -720,6 +752,7 @@ export function AppShell({
   const aside = (
     <aside
       className="app-sidebar"
+      ref={sidebar}
       aria-label={t.nav.sidebar}
       aria-hidden={!sidebarVisible}
       inert={!sidebarVisible}
@@ -907,7 +940,10 @@ export function AppShell({
           <div
             className="app-sidebar-peek"
             onPointerEnter={showPeek}
-            onPointerDown={showPeek}
+            onPointerDown={() => {
+              peekBlocked.current = false;
+              showPeek();
+            }}
             onPointerLeave={hidePeek}
           />
         )}
@@ -919,50 +955,59 @@ export function AppShell({
             onClick={foldSidebar}
           />
         )}
-        <main className="app-main">
-          {showHeader ? (
-            <header className="app-header">
-              <div className="app-header-title">
-                {/* 常驻并随侧栏滑动渐现，按钮增减不再跳。 */}
-                <div className="app-header-fold" data-collapsed={collapsed}>
-                  <IconButton
-                    title={t.nav.expandSidebar}
-                    aria-label={t.nav.expandSidebar}
-                    tabIndex={collapsed ? 0 : -1}
-                    onClick={pinSidebar}
-                  >
-                    <SidebarIcon className="button-icon" />
-                  </IconButton>
-                  <IconButton
-                    title={t.nav.newChat}
-                    aria-label={t.nav.newChat}
-                    tabIndex={collapsed ? 0 : -1}
-                    onClick={() => startNew(null)}
-                  >
-                    <PlusIcon className="button-icon" />
-                  </IconButton>
+        <main className="app-main" ref={main}>
+          <div
+            className="app-header-slot"
+            data-visible={showHeader}
+            aria-hidden={!showHeader}
+            inert={!showHeader}
+          >
+            <div className="app-header-clip">
+              <header className="app-header">
+                <div className="app-header-title">
+                  {/* 常驻并随侧栏滑动渐现，按钮增减不再跳。 */}
+                  <div className="app-header-fold" data-collapsed={collapsed}>
+                    <IconButton
+                      title={t.nav.expandSidebar}
+                      aria-label={t.nav.expandSidebar}
+                      tabIndex={collapsed ? 0 : -1}
+                      onClick={pinSidebar}
+                    >
+                      <SidebarIcon className="button-icon" />
+                    </IconButton>
+                    <IconButton
+                      title={t.nav.newChat}
+                      aria-label={t.nav.newChat}
+                      tabIndex={collapsed ? 0 : -1}
+                      onClick={() => startNew(null)}
+                    >
+                      <PlusIcon className="button-icon" />
+                    </IconButton>
+                  </div>
+                  {page === "chat" ? (
+                    <h1>{conversation?.title ?? t.nav.newConversation}</h1>
+                  ) : null}
                 </div>
-                {page === "chat" ? (
-                  <h1>{conversation?.title ?? t.nav.newConversation}</h1>
+                {detailsToggle ? (
+                  <div className="app-header-actions">
+                    <IconButton
+                      aria-pressed={detailsOpen}
+                      data-details-trigger=""
+                      aria-label={
+                        detailsOpen ? t.nav.hideDetails : t.nav.showDetails
+                      }
+                      title={
+                        detailsOpen ? t.nav.hideDetails : t.nav.showDetails
+                      }
+                      onClick={onToggleDetails}
+                    >
+                      <PanelIcon className="button-icon" />
+                    </IconButton>
+                  </div>
                 ) : null}
-              </div>
-              {detailsToggle ? (
-                <div className="app-header-actions">
-                  <IconButton
-                    aria-pressed={detailsOpen}
-                    data-details-trigger=""
-                    aria-label={
-                      detailsOpen ? t.nav.hideDetails : t.nav.showDetails
-                    }
-                    title={detailsOpen ? t.nav.hideDetails : t.nav.showDetails}
-                    onClick={onToggleDetails}
-                  >
-                    <PanelIcon className="button-icon" />
-                  </IconButton>
-                </div>
-              ) : null}
-            </header>
-          ) : null}
+              </header>
+            </div>
+          </div>
           {error && <Toast message={error} onDismiss={() => setError("")} />}
           <div className="app-body" ref={body}>
             <div className="app-view">{children}</div>

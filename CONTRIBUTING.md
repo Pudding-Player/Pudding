@@ -1,16 +1,16 @@
 # 贡献指南
 
-正式源码只有当前仓库一份。目录职责与产物位置见 [AGENTS.md](AGENTS.md)，开发命令见 [开发文档](docs/development.md)，文档入口见 [docs/README.md](docs/README.md)。
+主程序与 UI 源码维护在当前仓库，桥源码在 `bridges/<ID>/` 的独立仓库中维护。目录职责与产物位置见 [AGENTS.md](AGENTS.md)，开发命令见 [开发文档](docs/development.md)，文档入口见 [docs/README.md](docs/README.md)。
 
 ## 开始开发
 
-Windows 使用 Rust stable、Node.js 22.18+、.NET 8 SDK 和 Visual Studio 2022 C++ Build Tools。在仓库根目录运行 `npm install`；`npm run build` 构建界面，`npm run dist` 构建 Windows 安装包。首次构建会下载依赖。Moduloom 是可选预览工具，不是构建前提。Android 另需对应 SDK 与工具链。
+Windows 使用 Rust stable、Node.js 22.18+、.NET 8 SDK 和 Visual Studio 2022 C++ Build Tools。在仓库根目录运行 `npm run bridges:fetch` 与 `npm ci`；`npm run build` 构建界面，`npm run dist` 构建 Windows 安装包。首次构建会下载依赖。Moduloom 是可选预览工具，不是构建前提。Android 另需对应 SDK 与工具链。
 
-根目录的 Cargo/npm 锁文件目前按项目策略保留在本机，CI 使用 `npm install`。修改依赖时说明原因与验证结果，不提交机器专用路径。当前依赖策略不提供锁定版本的可重复构建保证。
+根目录的 Cargo/npm 锁文件随源码提交，桥仓使用 `scripts/bridges.lock.json` 锁定完整提交。桥修改先提交、推送到对应仓库，再更新主仓锁定文件；详见[仓库与构建链路](docs/repositories.md)。
 
 ## 修改边界
 
-- 通用 Agent 与 Harness 放在 `src/runtime/`、`src/model/`、`src/extension/`；BGI 适配放在 `src/bridge/`、`bgi-bridge/` 和 `plugins/bgi/`。
+- 通用 Agent 与 Harness 放在 `src/runtime/`、`src/model/`、`src/extension/`；BGI 适配放在 `src/bridge/`、`bridges/bgi/bgi-bridge/` 和 `bridges/bgi/plugins/bgi/`。
 - 共用 React 组件放在 `packages/ui/`，产品页面放在 `web/`；不复制组件到另一套页面。
 - 运行数据、截图、测试数据库与工具临时文件只使用规定的 `target/` 子目录。`dist/` 只放最终安装包及对应校验文件和清单。
 - 配置模板使用空凭据或环境变量引用，不提交真实配置、数据库、模型请求记录、私钥或用户资源。
@@ -20,7 +20,7 @@ Windows 使用 Rust stable、Node.js 22.18+、.NET 8 SDK 和 Visual Studio 2022 
 
 一个提交围绕一个可解释的功能或修复；重构、行为修改和生成数据更新尽量分别说明。提交说明写清问题、最终行为和实际验证范围。
 
-先运行 `npm run check:repo`。前端修改执行 `npm run build`，分发与发布脚本修改执行 `npm test`。Rust 修改执行 `cargo fmt --all -- --check`、`cargo check`、`cargo check --no-default-features`、`cargo clippy --all-targets --no-default-features -- -D warnings`，再选择相关测试；完整命令与人工验证要求见开发文档。BGI 索引修改另执行 `python bgi-bridge/dev/feature-guide-builder.py --check`。
+先运行 `npm run check:repo`。前端修改执行 `npm run build`，分发与发布脚本修改执行 `npm test`。Rust 修改执行 `cargo fmt --all -- --check`、`cargo check`、`cargo check --no-default-features`、`cargo clippy --all-targets --no-default-features -- -D warnings`，再选择相关测试；完整命令与人工验证要求见开发文档。BGI 索引修改另执行 `python bridges/bgi/bgi-bridge/dev/feature-guide-builder.py --check`。
 
 真实模型、Windows 桌面与游戏验证需要明确环境并手动选择，不因提交自动执行。编译通过、模拟测试通过、真实宿主调用与游戏任务完成分别报告。修改用户数据、运行游戏和发布线上资产需要符合任务授权。
 

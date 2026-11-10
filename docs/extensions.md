@@ -6,13 +6,13 @@ Pudding 通过技能（Skill）与插件（Plugin）扩展模型能力：技能�
 
 仓库里有以下可参考实例：
 
-- [`plugins/bgi/`](../plugins/bgi/)：随产品分发的 BetterGI 领域插件。
+- [`bridges/bgi/plugins/bgi/`](../bridges/bgi/plugins/bgi/)：随产品分发的 BetterGI 领域插件。
 - [`plugins/windows-scheduler/`](../plugins/windows-scheduler/)：随产品分发、默认关闭的定时任务插件，含独立页面、受限 MCP 接口及 AI 问答、时间解释、操作与结果判定技能。
 - [`plugins/web-search/`](../plugins/web-search/)：随产品分发、默认启用的网络搜索插件，提供原生搜索和网页读取；在插件页启停，不作为独立技能或手动命令展示。
 - [`plugins/example-weather/`](../plugins/example-weather/)：HTTP 工具示例，默认停用。
-- [`plugins/zzz/`](../plugins/zzz/)：绝区零一条龙独立反射桥与领域技能。
-- [`plugins/march7th/`](../plugins/march7th/)：三月七独立桥与领域技能。
-- [`plugins/maaend/`](../plugins/maaend/)：MaaEnd 独立桥与领域技能。
+- [`bridges/zzz/plugins/zzz/`](../bridges/zzz/plugins/zzz/)：绝区零一条龙独立反射桥与领域技能。
+- [`bridges/march7th/plugins/march7th/`](../bridges/march7th/plugins/march7th/)：三月七独立桥与领域技能。
+- [`bridges/maaend/plugins/maaend/`](../bridges/maaend/plugins/maaend/)：MaaEnd 独立桥与领域技能。
 
 ## 快速要点
 
@@ -59,7 +59,7 @@ tags: bgi, route
 | 用户技能 | `agent.skillDirectories` 配置的目录，含配置文件旁的 `skills/` | 界面上逐个开关 |
 | 插件技能 | 插件清单 `skills` 字段引入 | 随插件装载，插件停用后一并消失，界面上不单独列出 |
 
-产品自带的领域说明挂在 `plugins/bgi` 下，属于插件技能。
+产品自带的领域说明挂在 `bridges/bgi/plugins/bgi` 下，属于插件技能。
 
 ## Plugin 清单
 
@@ -154,7 +154,7 @@ tags: bgi, route
 
 ### BGI 服务
 
-`plugins/bgi` 清单引用应用内 `bgi` 服务。模型工具保留 `bgi.*` 原名及原执行策略，按标准 MCP 结构化结果往返；运行内核的原生请求和 Job 事件也通过该 MCP 连接到 BGI 提供方，再访问宿主桥。宿主来源检查、授权、实例和目录版本、幂等提交、就绪闸门及业务核验仍保留。
+`bridges/bgi/plugins/bgi` 清单引用应用内 `bgi` 服务。模型工具保留 `bgi.*` 原名及原执行策略，按标准 MCP 结构化结果往返；运行内核的原生请求和 Job 事件也通过该 MCP 连接到 BGI 提供方，再访问宿主桥。宿主来源检查、授权、实例和目录版本、幂等提交、就绪闸门及业务核验仍保留。
 
 `io.pudding/execution`、`io.pudding/error`、`io.pudding/internal` 是 MCP `_meta` 中的产品扩展。只有应用内服务可提供可信的执行策略与内部连接；内部连接不进入模型工具注册表。标准客户端可忽略这些扩展。
 
@@ -171,9 +171,15 @@ tags: bgi, route
 
 ## 独立宿主桥
 
-三月七、MaaEnd 与绝区零分别维护在 `plugins/march7th/`、`plugins/maaend/`、`plugins/zzz/`。每个目录独立包含插件清单、`bridge/`、领域技能和连接说明，不相互导入桥实现，也不把软件标识交给一个共用桥分流。
+三月七、MaaEnd 与绝区零分别维护在 `bridges/march7th/plugins/march7th/`、`bridges/maaend/plugins/maaend/`、`bridges/zzz/plugins/zzz/`。每个目录独立包含插件清单、`bridge/`、领域技能和连接说明，不相互导入桥实现，也不把软件标识交给一个共用桥分流。
 
 这三套桥使用现有 `httpTools` 契约登记工具。主程序继续负责插件启停、工具发现、参数校验、授权与技能装载；通用 MCP 支持仍可接入文档分析等其他插件。绝区零不再连接一条龙的 MCP 服务。
+
+正常业务沿用现有目录与执行接口。`capabilities.search` 分页返回工具清单和实时业务声明的摘要，`capabilities.describe` 才展开单项输入契约、来源和详情调用映射；声明和现场可调用性分别表达。`host.inspect` 为独立的缺口补足入口，保持 `onDemand`，不随正常读取自动解锁；只有本轮已有常规接口覆盖缺口、契约漂移或明确不可用的证据时才按需检查静态结构，不作为常态准备步骤。实现与生成关系见[公共披露协议](../packages/bridge-disclosure/README.md)。
+
+动态补足使用桥根据真实目录缺口签发的 `gapId` 和现场 `memberId`：`host.prepare` 只生成预览，`host.invoke`／`host.set` 只提交一次性 `planId`。计划绑定会话、对象、签名／原值及参数，最长五分钟有效，重连清空；执行前复核，不能替换参数或自动重试。动态写入按高风险外部写入、串行、禁止无人值守登记，全部保持 `onDemand`，不得当成常态准备或保存到快捷／定时任务。Python 字段修改仅保证运行时状态；MaaEnd 通过公开后端契约和官方条件保存适配，不提供任意 Rust 私有方法或 URL 透传。
+
+三套构建入口支持 `--production`，只编译产品原生文件。`scripts/generate-adapter-disclosure.mjs` 从公共模块和插件清单生成各插件自包含的 `bridge/generated/`；`--check` 校验生成一致性。独立拆仓时保留生成文件即可构建，不需要跨插件依赖。
 
 三套插件默认停用，导入和启用不会启动第三方软件。桥统一为 C++ 原生编译产物，各自使用独立端口和令牌，不附带 Python 等脚本桥或要求额外解释器。三月七与绝区零从原生侧调用宿主已加载运行时的反射接口；MaaEnd 使用 MXU 对已有实例公开的原生接口与任务描述，不能把它描述成对 Rust 私有对象进行 CLR 注入。各自的支持范围和手动入口见插件 README。
 

@@ -19,7 +19,7 @@
 | 现有入口 | 复用方式与限制 |
 | --- | --- |
 | `src/extension/plugins.rs`、`src/extension/mcp.rs` | 插件清单、按插件启停、应用内 MCP 注册；本地服务 ID 必须与插件 ID 对应。 |
-| `plugins/bgi/.pudding-plugin/plugin.json` | 应用内服务清单的结构参考，不把 BGI 领域逻辑搬到计划任务插件。 |
+| `bridges/bgi/plugins/bgi/.pudding-plugin/plugin.json` | 应用内服务清单的结构参考，不把 BGI 领域逻辑搬到计划任务插件。 |
 | `src/runtime/operation/shortcuts.rs` | 快捷任务保存时的契约校验、稳定参数、只读准备步骤和已绑定动作。 |
 | `src/runtime/mod.rs::submit_workflow` | 已发布修订、目标存在性检查及运行记录可复用。当前会返回同一快捷任务的已有活动运行，定时执行项不能据此冒充新的一次执行，需有专用提交入口及执行项身份。 |
 | `src/runtime/operation/task.rs`、`executor.rs` | 有 `ContinueIndependent` 策略，但当前快捷任务仍有失败或结果未确认即停止的分支，不能仅设置这个标记就声称实现逐项容错。 |

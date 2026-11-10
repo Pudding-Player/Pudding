@@ -40,42 +40,20 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'product-files.ps1')
+& node (Join-Path $PSScriptRoot 'bridges.mjs') verify
+if ($LASTEXITCODE -ne 0) { throw 'Bridge build verification failed' }
 
 # Defaults are resolved here, not in the param block: $PSScriptRoot is not set
 # yet while parameters are being bound.
 if (-not $Source) { $Source = Join-Path $PSScriptRoot '..\target\setup\staging' }
 if (-not $Output) { $Output = Join-Path $PSScriptRoot '..\target\setup' }
 
-$bridgeFiles = @(
-    'BgiBridge.Injector.exe',
-    'BgiBridge.Bootstrap.dll',
-    'BgiBridge.dll',
-    'BgiBridge.runtimeconfig.json',
-    'BgiBridge.deps.json',
-    'BgiBridge.Recovery.exe',
-    'BgiBridge.Recovery.dll',
-    'BgiBridge.Recovery.runtimeconfig.json',
-    'BgiBridge.Recovery.deps.json'
-)
-$pluginRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\plugins'))
-$pluginPrefix = $pluginRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
-$pluginSources = @(
-    foreach ($pluginName in @('bgi', 'windows-scheduler', 'web-search')) {
-        Get-ChildItem -LiteralPath (Join-Path $pluginRoot $pluginName) -Recurse -File
-    }
-)
-$pluginFiles = @(
-    $pluginSources | ForEach-Object { 'plugins/' + $_.FullName.Substring($pluginPrefix.Length).Replace('\', '/') }
-)
+$productFiles = @(Get-ProductFiles)
+$allowedFiles = @($productFiles.Relative)
 
 function Test-Included([string]$relative) {
-    if ($relative -eq 'pudding.exe') { return $true }
-    if ($relative -like 'plugins/*') { return $relative -in $pluginFiles }
-    if ($relative -like 'bridge/*') {
-        return $relative.Substring('bridge/'.Length) -in $bridgeFiles
-    }
-    # Runtime data (user/, bridge-cache/, WebView2/) must never enter setup.
-    return $false
+    return $relative -in $allowedFiles
 }
 
 $source = (Resolve-Path -LiteralPath $Source).Path
@@ -97,16 +75,9 @@ $files = @(
         Sort-Object -Property Path
 )
 
-$files = @(
-    @($files | Where-Object { $_.Path -notlike 'plugins/*' }) +
-    @($pluginSources | ForEach-Object {
-        [pscustomobject]@{
-            Path = 'plugins/' + $_.FullName.Substring($pluginPrefix.Length).Replace('\', '/')
-            Full = $_.FullName
-            Size = $_.Length
-        }
-    }) | Sort-Object -Property Path
-)
+if ($files.Count -ne $allowedFiles.Count -or @($allowedFiles | Where-Object { $_ -notin $files.Path }).Count) {
+    throw 'Staging does not contain the complete product whitelist'
+}
 if ($Executable) {
     $built = Get-Item -LiteralPath (Resolve-Path -LiteralPath $Executable).Path
     if ($built.PSIsContainer) { throw 'Executable must be a file' }
@@ -135,7 +106,7 @@ if ($files.Count -eq 0) {
 
 # The payload carries the template, never the token issued on this machine.
 $example = [System.IO.Path]::GetFullPath(
-    (Join-Path $PSScriptRoot '..\bgi-bridge\bridge.config.example.json'))
+    (Join-Path $PSScriptRoot '..\bridges\bgi\bgi-bridge\bridge.config.example.json'))
 if (-not (Test-Path -LiteralPath $example -PathType Leaf)) {
     throw "missing bridge config example: $example"
 }

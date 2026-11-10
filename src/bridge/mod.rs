@@ -12,6 +12,7 @@ pub(crate) mod resolve;
 pub(crate) mod retrieval;
 pub(crate) mod scheduled;
 pub(crate) mod task_semantics;
+pub(crate) mod ui_policy;
 
 use std::{
     fs,
@@ -813,7 +814,13 @@ pub fn register_tools(registry: &mut ToolRegistry, client: Arc<BgiClient>) -> Re
             },
         ),
     ]);
-    for (name, label, description, schema, function) in definitions {
+    for (name, label, description, mut schema, function) in definitions {
+        if matches!(
+            name,
+            "bgi.api.read" | "bgi.api.invoke" | "bgi.capability.invoke"
+        ) {
+            schema["properties"]["uiFallback"] = json!({"type":"object","properties":{"reason":{"type":"string","minLength":8},"evidenceCallIds":{"type":"array","minItems":2,"maxItems":8,"items":{"type":"string"}}},"required":["reason","evidenceCallIds"],"additionalProperties":false,"description":"仅 UI 最后手段使用：用户未明确要求界面时，提供本轮常规接口未命中和 CLR 成员确实不可调用的真实工具调用 ID；模型自写理由不能放行。"});
+        }
         let mut execution = if name == "bgi.host.close" {
             ToolExecution {
                 effect: ToolEffect::GameWrite,

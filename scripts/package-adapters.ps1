@@ -84,7 +84,7 @@ if ($Action -eq 'Check') {
 }
 
 foreach ($id in $Plugin) {
-    $source = Join-Path $root "plugins\$id"
+    $source = Join-Path $root "bridges/$id/plugins/$id"
     $manifestPath = Join-Path $source '.pudding-plugin\plugin.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.id -ne $id) { throw "Source plugin ID mismatch: $source" }
@@ -125,7 +125,18 @@ foreach ($id in $Plugin) {
         $manual = '先手动启动对应工具，在任务管理器取得其 GUI 进程 ID，再运行 `start-bridge.ps1 -TargetProcessId <进程 ID>`。桥只附着明确指定的现有进程，不会启动工具或游戏。'
     }
     $generated['start-bridge.ps1'] = "param($parameters)`r`n`$ErrorActionPreference = 'Stop'`r`nif (-not [Environment]::GetEnvironmentVariable('$token')) { throw 'Missing process environment: $token' }`r`n$command`r`nexit `$LASTEXITCODE`r`n"
-    $generated['README.md'] = "# $($manifest.name)`n`n版本：$($manifest.version)。这是独立插件目录；在 Pudding 的插件导入入口选择本目录，按需启用。`n`n$manual`n`nPudding 和启动桥的进程必须取得同一份 $token 环境变量，令牌不得写入插件包。默认桥地址为 http://127.0.0.1:$port。导入插件与启动桥分别操作；均不自动运行游戏任务。`n`n源码和开发说明位于正式工程 plugins/$id/。包内只含本插件的原生桥、清单、技能和说明，不含第三方工具、用户配置或测试程序。`n`n本轮仅完成编译、伪宿主和隔离夹具验证；未向真实第三方工具注入、连接或执行游戏。bridge-package.json 记录本目录文件校验值，原生文件各有对应 .sha256。`n"
+    $skillRows = @(foreach ($skill in Get-ChildItem -LiteralPath (Join-Path $source 'skills') -Recurse -File -Filter 'SKILL.md' | Sort-Object FullName) {
+        $text = [IO.File]::ReadAllText($skill.FullName)
+        $name = [regex]::Match($text, '(?m)^name:\s*(.+)\r?$').Groups[1].Value.Trim()
+        $description = [regex]::Match($text, '(?m)^description:\s*(.+)\r?$').Groups[1].Value.Trim().Replace('|', '\|')
+        if (-not $name -or -not $description) { throw "Skill entry lacks name or description: $($skill.FullName)" }
+        $relative = $skill.FullName.Substring($source.Length + 1).Replace('\', '/')
+        $isEntry = [regex]::IsMatch($text, '(?m)^alwaysLoad:\s*true\s*\r?$')
+        [pscustomobject]@{ Order = $(if ($isEntry) { 0 } else { 1 }); Name = $name; Relative = $relative; Description = $description; Role = $(if ($isEntry) { '领域入口' } else { '按需技能' }) }
+    })
+    $skillTable = @($skillRows | Sort-Object Order, Name | ForEach-Object { "| $($_.Role) | [$($_.Name)]($($_.Relative)) | $($_.Description) |" })
+    $skillGuide = "## 技能与按需资料`n`n领域入口说明对象与证据边界，操作技能按任务选择一份专题资料；不一次加载整套手册。具体任务、接口和参数由当前工具契约与宿主目录提供。`n`n| 层次 | 技能入口 | 说明 |`n| --- | --- | --- |`n" + ($skillTable -join "`n")
+    $generated['README.md'] = "# $($manifest.name)`n`n版本：$($manifest.version)。这是独立插件目录；在 Pudding 的插件导入入口选择本目录，按需启用。`n`n$manual`n`nPudding 和启动桥的进程必须取得同一份 $token 环境变量，令牌不得写入插件包。默认桥地址为 http://127.0.0.1:$port。导入插件与启动桥分别操作；均不自动运行游戏任务。`n`n$skillGuide`n`n源码和开发说明位于正式工程 plugins/$id/。包内只含本插件的原生桥、清单、技能和说明，不含第三方工具、用户配置或测试程序。`n`n包内文件按 bridge-package.json 校验，原生文件各有对应 .sha256。编译、静态核对、伪宿主和实机验收是不同证据层，具体以对应记录为准；本包不表示真实宿主注入、接口或游戏执行已验收。`n"
     $expected = @($files.Keys) + @($generated.Keys) + @('bridge-package.json')
     if (Test-Path -LiteralPath $directory) {
         foreach ($item in Get-ChildItem -LiteralPath $directory -Recurse -File -Force) {

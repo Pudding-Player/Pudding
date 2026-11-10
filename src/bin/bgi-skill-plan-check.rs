@@ -32,13 +32,13 @@ const CASE_TIMEOUT_SECS: u64 = 180;
 
 type Sim = Arc<Mutex<Simulator>>;
 
-/// 由 bgi-bridge/dev/export-method-metadata.ps1 从真实 BgiBridge.dll 导出的
+/// 由 bridges/bgi/bgi-bridge/dev/export-method-metadata.ps1 从真实 BgiBridge.dll 导出的
 /// 纯方法元数据（InputSchema + AgentGuide）；仅描述用，绝不调用 handler。
 fn method_metadata() -> &'static Value {
     static METADATA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     METADATA.get_or_init(|| {
         serde_json::from_str(include_str!(
-            "../../bgi-bridge/dev/bgi-method-metadata.json"
+            "../../bridges/bgi/bgi-bridge/dev/bgi-method-metadata.json"
         ))
         .expect("bgi-method-metadata.json 必须可解析")
     })
@@ -1971,7 +1971,7 @@ async fn main() -> std::process::ExitCode {
 
     let mut skills = SkillRegistry::default();
     if let Err(error) = skills.load(&[(
-        manifest.join("plugins/bgi/skills"),
+        manifest.join("bridges/bgi/plugins/bgi/skills"),
         SkillSource::Plugin("bgi".into()),
     )]) {
         eprintln!("技能注册表装载失败：{error}");

@@ -339,7 +339,10 @@ fn shipped_bgi_manifest_loads_and_disables_tools_with_its_plugin() {
         let mut skills = crate::extension::skills::SkillRegistry::default();
         plugins
             .load(
-                &[std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins")],
+                &[
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"),
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bridges/bgi/plugins"),
+                ],
                 &[],
                 &loading_disabled,
                 &mut tools,

@@ -85,7 +85,7 @@ flowchart TD
 
 `feature-index.json` 是离线知识索引，不等于当前宿主目录，也不授予执行权限。模型不会常驻读取全部条目。明确的运行请求直接查资源，明确的 JS 问题直接读脚本；分类没有结果不能推导为全仓没有，查询失败也不能推导为不存在。
 
-对应实现：[BGI 提供方工具](../src/bridge/mod.rs)、[离线功能索引](../src/bridge/features.rs)、[资源定位](../src/bridge/resolve.rs)、[检索路由](../src/bridge/retrieval.rs)、[运行时桥调用](../src/runtime/host/bridge.rs)、[托管桥宿主](../bgi-bridge/managed/Hosting/BridgeHost.cs)。
+对应实现：[BGI 提供方工具](../src/bridge/mod.rs)、[离线功能索引](../src/bridge/features.rs)、[资源定位](../src/bridge/resolve.rs)、[检索路由](../src/bridge/retrieval.rs)、[运行时桥调用](../src/runtime/host/bridge.rs)、[托管桥宿主](../bridges/bgi/bgi-bridge/managed/Hosting/BridgeHost.cs)。
 
 BGI 工具由插件清单引用标准 MCP 服务装载。工具发现、普通调用，以及运行内核的原生请求与 Job 事件，通过同一 MCP 连接进入 BGI 提供方；提供方内部继续使用宿主桥协议。通用 MCP 客户端同时支持 stdio 和 Streamable HTTP，协议由官方 `rmcp` SDK 实现。应用内服务通过字节管道执行真实协议往返；对外另有 stdio 入口，见 [插件格式](extensions.md#mcp)。
 
@@ -123,9 +123,9 @@ flowchart TD
 
 窗口与未注册子对象不会因为没有 `IViewModel` 标记而从目录消失。查询目录不构造窗口；构造是独立写操作。复杂对象以真实引用绑定，不能从用户 JSON 随意重建宿主对象。弹窗输入缺项、旧引用、同名多实例、错误参数和禁用命令均返回明确错误，不能把通用调用入口当绕过方式。
 
-反射只负责定位真实对象和调用已审查的业务入口，不创造宿主未实现的业务。旧补接实现及其 implementationInput 已删除；弃用、占位和脱离真实控件的生命周期命令不发布；当前可见编辑器与模态窗口通过原生 UI 续接，不能因为需要交互就删除功能。正常路线执行走资源定位、prepare_pathing_group 和 run_script_group；截图测试使用当前原生 start_capture_test。接口审阅报告由 `bgi-bridge/dev/interface-review.py` 生成到 `target/reports/bgi/`。
+反射只负责定位真实对象和调用已审查的业务入口，不创造宿主未实现的业务。旧补接实现及其 implementationInput 已删除；弃用、占位和脱离真实控件的生命周期命令不发布；当前可见编辑器与模态窗口通过原生 UI 续接，不能因为需要交互就删除功能。正常路线执行走资源定位、prepare_pathing_group 和 run_script_group；截图测试使用当前原生 start_capture_test。接口审阅报告由 `bridges/bgi/bgi-bridge/dev/interface-review.py` 生成到 `target/reports/bgi/`。
 
-对应实现：[命令发现与执行](../bgi-bridge/managed/Catalog/CommandCatalog.cs)、[目标与原生对象绑定](../bgi-bridge/managed/Bgi/CommandTargets.cs)、[上下文接口](../bgi-bridge/managed/Tools/CommandTargetTools.cs)、[本次弹窗输入](../bgi-bridge/managed/Bgi/NativeDialogScope.cs)。
+对应实现：[命令发现与执行](../bridges/bgi/bgi-bridge/managed/Catalog/CommandCatalog.cs)、[目标与原生对象绑定](../bridges/bgi/bgi-bridge/managed/Bgi/CommandTargets.cs)、[上下文接口](../bridges/bgi/bgi-bridge/managed/Tools/CommandTargetTools.cs)、[本次弹窗输入](../bridges/bgi/bgi-bridge/managed/Bgi/NativeDialogScope.cs)。
 
 ## JS 编写、OCR 与真实引擎契约
 
@@ -468,7 +468,7 @@ Anthropic 路径会合并相邻同角色消息，并把同轮 tool_result 放在
 
 所有应用共享同一条三层链路：技能名称与简介 → 主模型用 skills.read 读取正文 → skills.reference 读取相关资料。skills.search/read/reference 和 tools.search 是真实的通用入口，登记、重载与执行使用同一份当前技能数据；停用、平台及插件依赖条件一致检查。autoLoadSkills 只控制已参与插件的 alwaysLoad 短入口，普通子技能由模型选择；用户显式指定的技能照常读取。
 
-operate-task 与 continue-task 是应用无关的产品技能。前文不足时 conversation.inputs 只返回当前对话持久化的真实用户原话、来源和修订，不自动合并目标、不推断续办、不恢复旧授权。BGI 的目标路由、参数、路线／JS 前提、检索顺序和兑换流程均在 plugins/bgi/skills，能力目录只由真实源码声明和 MethodRegistry 注册快照生成；没有手工场景表、口语分类加分或预设流程条目。桥适配只提供真实目录、文件、接口和执行证据。
+operate-task 与 continue-task 是应用无关的产品技能。前文不足时 conversation.inputs 只返回当前对话持久化的真实用户原话、来源和修订，不自动合并目标、不推断续办、不恢复旧授权。BGI 的目标路由、参数、路线／JS 前提、检索顺序和兑换流程均在 bridges/bgi/plugins/bgi/skills，能力目录只由真实源码声明和 MethodRegistry 注册快照生成；没有手工场景表、口语分类加分或预设流程条目。桥适配只提供真实目录、文件、接口和执行证据。
 
 
 基础资料工具负责机械解析和关联：按当前名称定位声明，返回输入、返回类型、继承、来源及范围明确的核验标记；批量符号检查自动生成直接关系，不由模型手工拼接。业务意图与操作组合仍由主模型负责，技能不绑定具体 BGI 方法或布局。未知与歧义显式返回；离线声明解析通过不等于运行验证通过，也不因此触发运行。

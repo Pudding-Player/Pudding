@@ -513,7 +513,9 @@ pub fn prepare(config: &mut BridgeConfig) -> Result<()> {
     let mut settings: Value = if path.is_file() {
         serde_json::from_str(&std::fs::read_to_string(&path)?)?
     } else {
-        serde_json::from_str(include_str!("../../bgi-bridge/bridge.config.example.json"))?
+        serde_json::from_str(include_str!(
+            "../../bridges/bgi/bgi-bridge/bridge.config.example.json"
+        ))?
     };
     if !settings.is_object() {
         return Err(Error::Config("连接配置损坏。请重新安装 Pudding。".into()));

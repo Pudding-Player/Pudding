@@ -82,12 +82,12 @@ def main():
         headers.setdefault("x-api-key", key)
     runtime = (ROOT / "src/runtime/mod.rs").read_text(encoding="utf-8")
     core = re.search(r'const CORE_AGENT_POLICY: &str = r#"(.*?)"#;', runtime, re.S)[1]
-    skill = (ROOT / "plugins/bgi/skills/bgi-assistant/SKILL.md").read_text(encoding="utf-8").split("---", 2)[-1]
+    skill = (ROOT / "bridges/bgi/plugins/bgi/skills/bgi-assistant/SKILL.md").read_text(encoding="utf-8").split("---", 2)[-1]
     language_guides = "\n\n".join((ROOT / path).read_text(encoding="utf-8") for path in [
-        "plugins/bgi/skills/bgi-assistant/references/tool-workflow.md",
-        "plugins/bgi/skills/bgi-operator/references/shared.md",
+        "bridges/bgi/plugins/bgi/skills/bgi-assistant/references/tool-workflow.md",
+        "bridges/bgi/plugins/bgi/skills/bgi-operator/references/shared.md",
     ])
-    settings_guide = (ROOT / "plugins/bgi/skills/bgi-javascript/SKILL.md").read_text(encoding="utf-8").split("---", 2)[-1]
+    settings_guide = (ROOT / "bridges/bgi/plugins/bgi/skills/bgi-javascript/SKILL.md").read_text(encoding="utf-8").split("---", 2)[-1]
     ask_description = re.search(r'"user.ask",\s*"询问用户",\s*"([^"]+)"', runtime)[1]
     # Read the actual tool schema rather than a simplified probe-only variant.
     ask_properties = json.loads(re.search(r'"user.ask",.*?json!\((\{.*?\})\),\s*json!\(\[\]\)', runtime, re.S)[1])

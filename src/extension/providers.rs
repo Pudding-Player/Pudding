@@ -22,7 +22,10 @@ pub fn is_host_provider(id: &str) -> bool {
 }
 
 pub fn is_bundled_plugin(id: &str) -> bool {
-    matches!(id, "bgi" | "windows-scheduler" | WEB_PROVIDER)
+    matches!(
+        id,
+        "bgi" | "windows-scheduler" | WEB_PROVIDER | "march7th" | "zzz" | "maaend"
+    )
 }
 
 /// 宿主插件默认开启，写进 `plugins.disabled` 才算关掉。

@@ -41,10 +41,10 @@
   --font-item: 16px;
   --font-section: 18px;
   --font-page: 24px;
-  --gold: #c9a227;
-  --gold-bright: #f0d36a;
-  --chat-user: #ffd400;
-  --chat-user-text: #000;
+  --gold: #d09b4d;
+  --gold-bright: #f2dfbc;
+  --chat-user: #ff8a2b;
+  --chat-user-text: #ffffff;
   --chat-detail-rule: #d8d8d8;
   --chat-prose-width: 760px;
   --chat-message-meta-height: 24px;
@@ -77,10 +77,10 @@
   --well-inset: inset 0 1px 3px #000000b3, inset 0 0 0 1px #ffffff12;
   --knob: #2c2c2c;
   --knob-shadow: 0 1px 2px #000a, 0 4px 10px #0007, inset 0 1px 0 #ffffff18;
-  --gold: #e4bc4a;
-  --gold-bright: #f6e19a;
-  --chat-user: #ffd400;
-  --chat-user-text: #000;
+  --gold: #e8b26a;
+  --gold-bright: #f2dfbc;
+  --chat-user: #ff8a2b;
+  --chat-user-text: #ffffff;
   --chat-detail-rule: #3a3a3a;
   color-scheme: dark;
 }

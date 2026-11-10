@@ -8,19 +8,33 @@ use pudding::extension::{
 
 const IDS: [&str; 3] = ["march7th", "maaend", "zzz"];
 
-fn plugin_root() -> PathBuf {
-    std::env::var_os("PUDDING_PLUGIN_FIXTURE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins"))
+fn plugin_roots() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("PUDDING_PLUGIN_FIXTURE_ROOT") {
+        return vec![PathBuf::from(path)];
+    }
+    IDS.map(|id| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("bridges")
+            .join(id)
+            .join("plugins")
+    })
+    .to_vec()
 }
 
 #[test]
 fn independent_bridges_load_tools_and_skills_without_starting_hosts() {
-    let root = plugin_root();
+    let roots = plugin_roots();
     let mut endpoints = HashSet::new();
     for id in IDS {
         let manifest: PluginManifest = serde_json::from_slice(
-            &std::fs::read(root.join(id).join(".pudding-plugin/plugin.json")).unwrap(),
+            &std::fs::read(
+                roots
+                    .iter()
+                    .map(|root| root.join(id).join(".pudding-plugin/plugin.json"))
+                    .find(|path| path.is_file())
+                    .unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(manifest.id, id);
@@ -60,7 +74,7 @@ fn independent_bridges_load_tools_and_skills_without_starting_hosts() {
     let mut skills = SkillRegistry::default();
     manager
         .load(
-            &[root],
+            &roots,
             &IDS.map(str::to_owned),
             &[
                 "bgi".into(),
@@ -89,7 +103,8 @@ fn independent_bridges_load_tools_and_skills_without_starting_hosts() {
         for skill in skills
             .list()
             .iter()
-            .filter(|skill| skill.source.plugin() == Some(id))
+            // 常驻入口与按需操作资料分层；后者不限定为入口的固定三份引用。
+            .filter(|skill| skill.source.plugin() == Some(id) && skill.always_load)
         {
             assert!(
                 skill.body.chars().count() < 1200,
@@ -131,7 +146,7 @@ fn independent_bridges_are_disabled_by_default() {
     let mut skills = SkillRegistry::default();
     manager
         .load(
-            &[plugin_root()],
+            &plugin_roots(),
             &[],
             &[
                 "bgi".into(),

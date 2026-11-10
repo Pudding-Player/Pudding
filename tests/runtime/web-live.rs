@@ -136,7 +136,7 @@ async fn live_web_task_knowledge_gap_is_selected_without_explicit_search_words()
     let mut skills = crate::extension::skills::SkillRegistry::default();
     skills
         .load(&[(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/bgi/skills"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bridges/bgi/plugins/bgi/skills"),
             crate::extension::skills::SkillSource::Plugin("bgi".into()),
         )])
         .unwrap();

@@ -7,11 +7,15 @@ on:
     branches: ["**"]
   pull_request:
   workflow_call:
+    secrets:
+      BRIDGE_READ_TOKEN:
+        required: false
 
 jobs:
   windows:
     runs-on: windows-2022
     env:
+      PUDDING_BRIDGE_READ_TOKEN: ${{ secrets.BRIDGE_READ_TOKEN }}
       TEMP: ${{ github.workspace }}\target\ci\tmp
       TMP: ${{ github.workspace }}\target\ci\tmp
     steps:
@@ -22,13 +26,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Fetch pinned bridge repositories
+        run: node scripts/bridges.mjs fetch --locked
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
-      - run: npm install
+      - run: npm ci
       - run: npm run check:repo
       - run: npm run build
       - run: npm test
@@ -36,11 +42,21 @@ jobs:
       - run: cargo check
       - run: cargo check --no-default-features
       - name: Validate bridge data migration
-        run: dotnet run --project bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --data-migration
+        run: dotnet run --project bridges/bgi/bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --data-migration
       - name: Validate workspace PowerShell execution
         run: cargo test --no-default-features --lib runtime::workspace::tests::shell_ -- --nocapture
       - name: Validate BGI progressive disclosure
         run: |
-          dotnet run --project bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --check-interfaces bgi-bridge/dev/bgi-method-metadata.json
-          python bgi-bridge/dev/feature-guide-builder.py --check
+          dotnet run --project bridges/bgi/bgi-bridge/dev/ProductionCoreChecks.csproj --configuration Release -- --check-interfaces bridges/bgi/bgi-bridge/dev/bgi-method-metadata.json
+          python bridges/bgi/bgi-bridge/dev/feature-guide-builder.py --check
           cargo test --no-default-features --lib
+      - name: Build assembled installer
+        run: npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pudding-windows-installer
+          path: |
+            dist/Pudding-*-setup.exe
+            dist/Pudding-*-setup.exe.sha256
+            dist/Pudding-*-release.json
+          if-no-files-found: error

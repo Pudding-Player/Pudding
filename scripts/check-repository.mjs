@@ -12,6 +12,7 @@ const allowedRoot = new Set([
   ".cursor",
   ".zcode",
   ".gitignore",
+  ".gitattributes",
   ".npmrc",
   ".prettierrc",
   ".zcodeignore",
@@ -34,7 +35,7 @@ const allowedRoot = new Set([
   "src",
   "web",
   "packages",
-  "bgi-bridge",
+  "bridges",
   "plugins",
   "android",
   "frame",
@@ -63,7 +64,14 @@ const listed = execFileSync(
     windowsHide: true,
   },
 );
-const files = [...new Set(listed.split("\0").filter(Boolean))].filter((file) =>
+const bridgeLock = JSON.parse(readFileSync(resolve(root, 'scripts/bridges.lock.json'), 'utf8'));
+const bridgeFiles = bridgeLock.bridges.flatMap(bridge => {
+  if (!existsSync(resolve(root, bridge.path, '.git'))) return [];
+  return execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], {
+    cwd: resolve(root, bridge.path), encoding: 'utf8', windowsHide: true,
+  }).split('\0').filter(Boolean).map(file => `${bridge.path}/${file}`);
+});
+const files = [...new Set([...listed.split("\0").filter(Boolean), ...bridgeFiles])].filter((file) =>
   existsSync(resolve(root, file)),
 );
 const sensitive =

@@ -71,7 +71,8 @@ async fn live_bgi_skill_efficiency() {
             let mut skills = SkillRegistry::default();
             skills
                 .load(&[(
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/bgi/skills"),
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("bridges/bgi/plugins/bgi/skills"),
                     crate::extension::skills::SkillSource::Plugin("bgi".into()),
                 )])
                 .unwrap();

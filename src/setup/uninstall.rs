@@ -60,9 +60,14 @@ pub fn blocking_programs(archive: &Archive, directory: &Path) -> Result<Vec<Stri
         directory,
         crate::config::fallback_directory().as_deref(),
     )?;
+    Ok(program_owners(&blocking_files(archive, directory)))
+}
+
+/// 查询给定程序文件的占用者；这里只读取信息，不关闭任何进程。
+pub(super) fn program_owners(files: &[PathBuf]) -> Vec<String> {
     let mut names = Vec::new();
-    for path in blocking_files(archive, directory) {
-        let owners = lock_owners(&path);
+    for path in files.iter().filter(|path| is_program(path) && in_use(path)) {
+        let owners = lock_owners(path);
         if owners.is_empty() {
             names.push(path.display().to_string());
         } else {
@@ -71,7 +76,7 @@ pub fn blocking_programs(archive: &Archive, directory: &Path) -> Result<Vec<Stri
     }
     names.sort();
     names.dedup();
-    Ok(names)
+    names
 }
 
 /// 仅在用户点击“关闭占用程序并卸载”后调用，正常关闭已登记文件的占用者。
@@ -81,20 +86,29 @@ pub fn close_blocking_programs(archive: &Archive, directory: &Path) -> Result<()
         directory,
         crate::config::fallback_directory().as_deref(),
     )?;
-    let files = blocking_files(archive, directory);
-    if files.is_empty() {
+    close_program_files(&blocking_files(archive, directory), "卸载")
+}
+
+/// 更新和卸载共用同一条非强制关闭链路，调用者提供各自精确的程序文件范围。
+pub(super) fn close_program_files(files: &[PathBuf], operation: &str) -> Result<(), Error> {
+    let busy: Vec<PathBuf> = files
+        .iter()
+        .filter(|path| is_program(path) && in_use(path))
+        .cloned()
+        .collect();
+    if busy.is_empty() {
         return Ok(());
     }
-    graceful_close(&files)?;
+    graceful_close(&busy)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if blocking_files(archive, directory).is_empty() {
+        if busy_program(files).is_none() {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(Error::message(
-                "占用程序尚未退出，卸载未开始。请确认程序已保存工作后重试。",
-            ));
+            return Err(Error::message(format!(
+                "占用程序尚未退出，{operation}未开始。请确认程序已保存工作后重试。"
+            )));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -163,7 +177,7 @@ fn graceful_close(files: &[PathBuf]) -> Result<(), Error> {
         let result = RmShutdown(session.0, 0, None);
         if result != 0 {
             return Err(Error::message(format!(
-                "占用程序未能正常退出，卸载未开始（错误码 {result}）"
+                "占用程序未能正常退出（错误码 {result}）"
             )));
         }
         Ok(())

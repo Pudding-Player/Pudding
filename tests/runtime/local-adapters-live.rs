@@ -4,8 +4,10 @@ use crate::extension::plugins::{PluginManager, PluginState};
 use crate::runtime::host::hooks::{HookEventKind, HookOutcome};
 
 fn task_catalog(workspace: &std::path::Path) -> Vec<Value> {
-    let source =
-        std::fs::read_to_string(workspace.join("plugins/march7th/bridge/core.cpp")).unwrap();
+    let source = std::fs::read_to_string(
+        workspace.join("bridges/march7th/plugins/march7th/bridge/core.cpp"),
+    )
+    .unwrap();
     let table = source
         .split("const std::map<std::string, std::string>& AllowedTasks()")
         .nth(1)
@@ -280,7 +282,10 @@ async fn rejected_write_draft_is_reviewed_without_resubmission() {
 async fn plugin_rejected_submission_is_distinct_from_unknown_write() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest: Value = serde_json::from_slice(
-        &std::fs::read(workspace.join("plugins/march7th/.pudding-plugin/plugin.json")).unwrap(),
+        &std::fs::read(
+            workspace.join("bridges/march7th/plugins/march7th/.pudding-plugin/plugin.json"),
+        )
+        .unwrap(),
     )
     .unwrap();
     let execution: crate::extension::ToolExecution = serde_json::from_value(

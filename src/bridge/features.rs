@@ -115,7 +115,7 @@ impl FeatureIndex {
             return Ok(index.clone());
         }
         let index = Arc::new(Self::parse(include_str!(
-            "../../plugins/bgi/resources/feature-index.json"
+            "../../bridges/bgi/plugins/bgi/resources/feature-index.json"
         ))?);
         let _ = INDEX.set(index.clone());
         Ok(index)
@@ -503,7 +503,7 @@ mod tests {
     fn all_source_features_have_progressive_cards() {
         let index = FeatureIndex::bundled().unwrap();
         let audit: Value = serde_json::from_str(include_str!(
-            "../../bgi-bridge/dev/fixtures/host-features.json"
+            "../../bridges/bgi/bgi-bridge/dev/fixtures/host-features.json"
         ))
         .unwrap();
         for item in audit["commands"]
@@ -602,7 +602,7 @@ mod tests {
         let mut skills = crate::extension::skills::SkillRegistry::default();
         skills
             .load(&[(
-                root.join("plugins/bgi/skills"),
+                root.join("bridges/bgi/plugins/bgi/skills"),
                 crate::extension::skills::SkillSource::Plugin("bgi".into()),
             )])
             .unwrap();
@@ -682,7 +682,7 @@ mod tests {
         let mut skills = crate::extension::skills::SkillRegistry::default();
         skills
             .load(&[(
-                root.join("plugins/bgi/skills"),
+                root.join("bridges/bgi/plugins/bgi/skills"),
                 crate::extension::skills::SkillSource::Plugin("bgi".into()),
             )])
             .unwrap();
@@ -705,7 +705,7 @@ mod tests {
         use crate::runtime::operation::shortcuts::{ShortcutBinding, nodes};
         let (registry, catalog) = production_catalog();
         let descriptors: Value = serde_json::from_str(include_str!(
-            "../../bgi-bridge/dev/bgi-method-metadata.json"
+            "../../bridges/bgi/bgi-bridge/dev/bgi-method-metadata.json"
         ))
         .unwrap();
         let (id, descriptor) = descriptors
@@ -742,16 +742,16 @@ mod tests {
         let mut skills = crate::extension::skills::SkillRegistry::default();
         skills
             .load(&[(
-                root.join("plugins/bgi/skills"),
+                root.join("bridges/bgi/plugins/bgi/skills"),
                 crate::extension::skills::SkillSource::Plugin("bgi".into()),
             )])
             .unwrap();
         let descriptors: Value = serde_json::from_str(include_str!(
-            "../../bgi-bridge/dev/bgi-method-metadata.json"
+            "../../bridges/bgi/bgi-bridge/dev/bgi-method-metadata.json"
         ))
         .unwrap();
         let bindings: Value = serde_json::from_str(include_str!(
-            "../../bgi-bridge/managed/generated/host-documentation.json"
+            "../../bridges/bgi/bgi-bridge/managed/generated/host-documentation.json"
         ))
         .unwrap();
         for skill in skills.list() {
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn behavioral_fixtures_keep_raw_requests_and_outcomes_without_retrieval_answers() {
         let scenarios: Value = serde_json::from_str(include_str!(
-            "../../bgi-bridge/dev/fixtures/user-scenarios.json"
+            "../../bridges/bgi/bgi-bridge/dev/fixtures/user-scenarios.json"
         ))
         .unwrap();
         let domains = scenarios["domains"].as_array().unwrap();
@@ -893,7 +893,7 @@ mod tests {
     fn registered_contract_descriptions_are_searchable_as_real_metadata() {
         let index = FeatureIndex::bundled().unwrap();
         let descriptors: Value = serde_json::from_str(include_str!(
-            "../../bgi-bridge/dev/bgi-method-metadata.json"
+            "../../bridges/bgi/bgi-bridge/dev/bgi-method-metadata.json"
         ))
         .unwrap();
         for (id, descriptor) in descriptors.as_object().unwrap() {

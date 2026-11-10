@@ -5,7 +5,8 @@
 Windows 构建需要 Rust stable（edition 2024）、Node.js 22.18+、.NET 8 SDK、Visual Studio 2022 C++ Build Tools（x64）。主程序运行需要 WebView2 Runtime；安装器使用 Slint 原生界面，启动不依赖 WebView2。Linux 桌面开发另需 GTK/WebKitGTK。
 
 ```powershell
-npm install
+npm run bridges:fetch
+npm ci
 npm run dist
 ```
 
@@ -29,11 +30,11 @@ npm run dist
 | `npm run clean:rust -- -WhatIf` | 预览可清理的 Rust 缓存 |
 | `npm run clean:rust` | 清理上述缓存 |
 
-完整构建由 `scripts/build.cmd` 执行，内部调用 `bgi-bridge/build.cmd` 和 `scripts/pack-payload.ps1`。单独修改桥时可执行 `bgi-bridge/build.cmd`。桥通过影拷贝加载；重建不强制结束 BetterGI，连接后核对实际加载版本。
+完整构建由 `scripts/build.cmd` 执行，先按锁定文件获取并编译四套桥，再构建主仓 UI、Rust 主程序和安装器。独立仓构建入口与本地开发方式见[仓库与构建链路](repositories.md)。桥通过影拷贝加载；重建不强制结束 BetterGI，连接后核对实际加载版本。
 
 安装器入口为 `src/bin/pudding-setup.rs`，原生界面为 `src/setup/ui.slint`，由 `setup` 特性构建并嵌入。Vite 只构建主程序和托盘界面。安装器固定使用深色样式，不读取主程序主题设置；要求管理员权限，窗口首次显示时居中。运行时检测、安装、更新和卸载通过 Rust 安装引擎执行。
 
-`package-lock.json` 与 `Cargo.lock` 为本机文件，Git 忽略它们；CI 使用 `npm install`。构建脚本把 `TEMP`、`TMP` 指向 `target/tmp/`，npm 缓存在 `target/npm-cache/`。
+`package-lock.json` 与 `Cargo.lock` 随源码提交，CI 使用 `npm ci`；桥仓使用完整提交 SHA 锁定。构建脚本把 `TEMP`、`TMP` 指向 `target/tmp/`，npm 缓存在 `target/npm-cache/`。
 
 Rust 中间产物继承 Cargo 的全局共享 `build-dir` 配置，构建入口不覆盖为项目目录。全局缓存保留供多个项目复用；`target/debug/`、`target/release/` 继续保存程序等标准输出，隔离测试数据仍归 `target/.tmp/`。
 
@@ -72,15 +73,15 @@ cargo check --no-default-features
 cargo test --no-default-features --lib
 cargo test --no-default-features --lib extension::mcp::tests
 cargo clippy --all-targets --no-default-features -- -D warnings
-python bgi-bridge/dev/feature-guide-builder.py --check
-dotnet run --project bgi-bridge/dev/ProductionCoreChecks.csproj -- --check-interfaces bgi-bridge/dev/bgi-method-metadata.json
+python bridges/bgi/bgi-bridge/dev/feature-guide-builder.py --check
+dotnet run --project bridges/bgi/bgi-bridge/dev/ProductionCoreChecks.csproj -- --check-interfaces bridges/bgi/bgi-bridge/dev/bgi-method-metadata.json
 ```
 
 CI 执行前端、发布脚本、Rust 格式／编译／库测试及功能索引一致性检查；clippy 在本地执行。
 
 MCP 协议测试使用 `tests/runtime/mcp-fixture.mjs` 作为独立 Node 测试端，覆盖 stdio、HTTP JSON/SSE、有会话与无会话服务、取消通知、输出契约、错误，以及 BGI 工具迁移前后的契约一致性。测试端只绑定随机回环端口，退出时结束本任务子进程；不连接真实游戏或模型。
 
-`tests/ui/` 用 Playwright 验证实际 React 界面，`tests/desktop/` 验证窗口与托盘，`tests/runtime/` 验证运行时行为。`bgi-bridge/dev/` 保留桥专项 C# 检查、元数据生成器及宿主接口盘点工具。需要模型或真实宿主的验证必须单独说明环境与范围，不能算作游戏全流程通过。
+`tests/ui/` 用 Playwright 验证实际 React 界面，`tests/desktop/` 验证窗口与托盘，`tests/runtime/` 验证运行时行为。`bridges/bgi/bgi-bridge/dev/` 保留桥专项 C# 检查、元数据生成器及宿主接口盘点工具。需要模型或真实宿主的验证必须单独说明环境与范围，不能算作游戏全流程通过。
 
 ## 浏览器预览
 
@@ -123,13 +124,13 @@ MCP 协议测试使用 `tests/runtime/mcp-fixture.mjs` 作为独立 Node 测试�
 桥内嵌源码文档是构建输入，更新宿主版本时重新生成：
 
 ```powershell
-dotnet run --project bgi-bridge/dev/MetadataBuilder.csproj -- <BGI源码根目录> bgi-bridge/managed/generated/host-documentation.json --surface-output bgi-bridge/dev/fixtures/host-surface.json
-powershell -NoProfile -File bgi-bridge/dev/export-method-metadata.ps1
-python bgi-bridge/dev/coverage-audit.py <BGI源码根目录> --update-fixture
-python bgi-bridge/dev/feature-guide-builder.py
+dotnet run --project bridges/bgi/bgi-bridge/dev/MetadataBuilder.csproj -- <BGI源码根目录> bridges/bgi/bgi-bridge/managed/generated/host-documentation.json --surface-output bridges/bgi/bgi-bridge/dev/fixtures/host-surface.json
+powershell -NoProfile -File bridges/bgi/bgi-bridge/dev/export-method-metadata.ps1
+python bridges/bgi/bgi-bridge/dev/coverage-audit.py <BGI源码根目录> --update-fixture
+python bridges/bgi/bgi-bridge/dev/feature-guide-builder.py
 ```
 
-覆盖报告与现场契约快照生成到 `target/reports/bgi/`。确认需要更新功能索引的基准时，对盘点命令加 `--update-fixture`，再执行 `python bgi-bridge/dev/feature-guide-builder.py`。基准位于 `bgi-bridge/dev/fixtures/host-features.json`，口语目标测试数据位于同目录的 `user-scenarios.json`；前者供索引生成，后者仅保存测试请求和行为约束，不参与生产检索，不能当作现场运行证据。
+覆盖报告与现场契约快照生成到 `target/reports/bgi/`。确认需要更新功能索引的基准时，对盘点命令加 `--update-fixture`，再执行 `python bridges/bgi/bgi-bridge/dev/feature-guide-builder.py`。基准位于 `bridges/bgi/bgi-bridge/dev/fixtures/host-features.json`，口语目标测试数据位于同目录的 `user-scenarios.json`；前者供索引生成，后者仅保存测试请求和行为约束，不参与生产检索，不能当作现场运行证据。
 
 `host-surface.json` 额外盘点主程序与其项目引用中的宿主类型、公共方法、命令及构造器。源文件指纹、源码版本和索引必须一致；嵌套类型按词法作用域解析，partial 成员合并后保留各自源文件。未引用的测试工程不进入产品声明。`hostApi` 只是源码引用，不新增可调用方法；桥的注册快照由当前编译结果导出，CI 会拒绝新增接口而快照未更新的情况。
 

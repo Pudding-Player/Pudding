@@ -8,6 +8,10 @@
     "packages/*"
   ],
   "scripts": {
+    "bridges:fetch": "node scripts/bridges.mjs fetch",
+    "bridges:status": "node scripts/bridges.mjs status",
+    "bridges:lock": "node scripts/bridges.mjs lock",
+    "bridges:build": "node scripts/bridges.mjs build",
     "dev": "vite",
     "frame": "node scripts/frame.mjs dev",
     "frame:setup": "node scripts/frame.mjs setup",
@@ -19,6 +23,7 @@
     "android:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Action publish",
     "android:preview": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Action preview",
     "android:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Action check",
+    "prebackend": "node scripts/bridges.mjs prepare",
     "backend": "cargo run --no-default-features --features dev-ipc --bin pudding-dev",
     "desktop": "npm run dist && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Action Desktop",
     "typecheck": "tsc -p tsconfig.json --noEmit",

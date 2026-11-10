@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "bridges": [
+    {
+      "id": "bgi",
+      "repository": "https://github.com/Pudding-Player/Pudding-BGI-Bridge.git",
+      "path": "bridges/bgi",
+      "revision": "6f1e04a7385404cdc0afa7b258cda10b7d7de37d",
+      "bundled": true,
+      "binaries": [
+        "BgiBridge.Injector.exe",
+        "BgiBridge.Bootstrap.dll",
+        "BgiBridge.dll",
+        "BgiBridge.runtimeconfig.json",
+        "BgiBridge.deps.json",
+        "BgiBridge.Recovery.exe",
+        "BgiBridge.Recovery.dll",
+        "BgiBridge.Recovery.runtimeconfig.json",
+        "BgiBridge.Recovery.deps.json"
+      ]
+    },
+    {
+      "id": "march7th",
+      "repository": "https://github.com/Pudding-Player/Pudding-March7th-Bridge.git",
+      "path": "bridges/march7th",
+      "revision": "add5b222035053bc3f0cf97621ad6cd3e075b5a7",
+      "bundled": true,
+      "binaries": [
+        "march7th_bridge.dll",
+        "march7th_injector.exe"
+      ]
+    },
+    {
+      "id": "zzz",
+      "repository": "https://github.com/Pudding-Player/Pudding-ZZZ-Bridge.git",
+      "path": "bridges/zzz",
+      "revision": "987305731d721894f994ab03a1702375a697dae8",
+      "bundled": true,
+      "binaries": [
+        "zzz_bridge.dll",
+        "zzz_injector.exe"
+      ]
+    },
+    {
+      "id": "maaend",
+      "repository": "https://github.com/Pudding-Player/Pudding-MAAEnd-Bridge.git",
+      "path": "bridges/maaend",
+      "revision": "d2fa496ee1f68786db647361fb88bc1f5ec5e159",
+      "bundled": true,
+      "binaries": [
+        "maaend-bridge.exe"
+      ]
+    }
+  ]
+}

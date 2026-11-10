@@ -20,6 +20,7 @@ jobs:
   replace:
     runs-on: windows-2022
     env:
+      PUDDING_BRIDGE_READ_TOKEN: ${{ secrets.BRIDGE_READ_TOKEN }}
       TEMP: ${{ github.workspace }}\target\ci\tmp
       TMP: ${{ github.workspace }}\target\ci\tmp
       npm_config_cache: ${{ github.workspace }}\target\ci\npm-cache
@@ -55,13 +56,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Fetch pinned bridge repositories
+        run: node scripts/bridges.mjs fetch --locked
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
-      - run: npm install
+      - run: npm ci
       - name: Validate migration and replacement rollback
         run: |
           cargo fmt --all -- --check

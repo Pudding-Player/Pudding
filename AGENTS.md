@@ -4,7 +4,7 @@
 
 ## 1. 源码事实源
 
-- 正式源码只有本仓库一份，当前本机位置为 `E:\BetterGIProject\Sleepy-Doll`。原地修改，保留用户及其他任务已有改动。
+- Pudding 主仓正式源码位于 `E:\BetterGIProject\Sleepy-Doll`。原地修改，保留用户及其他任务已有改动。桥层已授权拆分为四个独立仓库，各自唯一正式检出位于 `bridges/<ID>/`；UI 继续由本仓 monorepo 维护。
 - 未经用户明确要求，不复制仓库，不创建 worktree、镜像仓库、分支副本或另一个项目目录。工具确实要求临时副本时，先检查可复用路径，登记用途与清理时机；同一项目同时最多一个。
 - 新文件必须能说明所属模块、用途和生命周期。先复用下表中的位置；禁止随手新增一个“暂时放东西”的目录。目录已存在或被 `.gitignore` 忽略，都不表示可以继续向其中堆文件。
 
@@ -15,8 +15,8 @@
 | `src/` | Rust 桌面壳、Agent、持久化、桥适配、安装引擎及 Slint 原生安装界面源码。 |
 | `web/` | 主程序、托盘的 React 页面与应用层样式。生产构建写入 `target/ui/`，不写 `web/dist/`。 |
 | `packages/` | 仓库内共享模块，如 `ui/`、`ui-android/`；禁止复制一套组件实现到其他页面目录。 |
-| `bgi-bridge/` | native、managed 桥、恢复工具、宿主资料生成器及其正式测试输入。构建输出进入 `target/bridge/`、`target/dotnet/`。 |
-| `plugins/` | 正式插件、技能和领域资源；禁止存放运行后的缓存或用户配置。`march7th/`、`zzz/`、`maaend/` 三个含注入桥的适配插件是可整体搬出的单元（见 `plugins/README.md`），计划拆分到维护者组织下的独立仓库，主程序与它们只保持 localhost HTTP 契约。 |
+| `bridges/` | 四个独立桥仓的唯一正式检出：`bgi/`、`march7th/`、`zzz/`、`maaend/`。主仓忽略源码，通过 `scripts/bridges.lock.json` 锁定并自动获取。独立构建使用各桥 `target/`，主仓组装通过显式输出参数汇总到主仓 `target/bridge/`。 |
+| `plugins/` | 主仓维护的通用插件、技能和资源；宿主桥插件源码归各自 `bridges/<ID>/plugins/<ID>/`，不在此复制。开发装载资源生成到 `target/dev/plugins/`。 |
 | `android/` | Android 工程源码与工具链必需配置。自有构建、Gradle 缓存和运行期临时文件归 `target/android/`、`target/tmp/android/`；工具不可避免的标准目录不得另复制一份。 |
 | `frame/` | 可选组件预览适配。产物归 `target/frame/`、`target/frame-android/`；可选工具依赖可使用既有 `frame/node_modules/`，不得进入产品安装包。 |
 | `cloudflare/` | 分发服务源码与测试。 |
@@ -38,7 +38,7 @@
 | --- | --- |
 | `target/debug/`、`target/release/` | Cargo 标准构建结果与缓存，保留供增量构建使用；不是第二份分发目录。 |
 | `target/ui/`、`target/bridge/`、`target/dotnet/` | 前端、桥与 native/.NET 的标准构建结果。 |
-| `target/setup/staging/` | 唯一 Windows 安装包组装暂存目录，只含主程序、桥组件、插件及空凭据模板。不得在此启动产品；每次从明确清单组装，组包结束后清理。 |
+| `target/setup/staging/` | 唯一 Windows 安装包组装暂存目录，只含主程序、四套桥组件、插件及空凭据模板。不得在此启动产品；每次从明确清单组装，组包结束后清理。 |
 | `target/setup/payload.bin`、`target/setup/payload.json` | 安装器编译输入，生成并校验后嵌入安装器；本轮安装器构建结束后清理。 |
 | `target/dev/` | 开发 IPC 端口文件、开发配置、用户数据及开发运行资源；既有开发配置入口为 `target/dev/user/config.json`。 |
 | `target/dev/desktop/` | 需要启动组装版桌面程序时的固定开发目录；不得借启动或验收往 `dist/` 写运行数据。默认打包无需额外交付此目录。 |
@@ -73,7 +73,7 @@ dist/
 
 - 默认仅保留当前交付版本的一套 Windows 安装包及其对应校验文件、清单，不堆历史版本，不同时留下 ZIP、另一份 EXE 或解包后的同内容目录。版本归档由正式发布渠道承担。
 - Android 交付物仅归 `dist/android/`；未做该平台交付时，不为凑目录树创建空目录。其他平台确需增加时，先在本文件登记唯一子目录，并同步相关脚本。
-- 独立适配插件仅归 `dist/plugins/<插件 ID>/`，由 `scripts/package-adapters.ps1` 按明确清单组装与校验；每个插件只保留一份当前目录，不同时另留 ZIP 或源码副本。不得带第三方工具本体、源码、测试程序、构建脚本、凭据或运行数据，不随默认安装包自动安装或启用。
+- 独立适配插件仅归 `dist/plugins/<插件 ID>/`，由 `scripts/package-adapters.ps1` 按明确清单组装与校验；每个插件只保留一份当前目录，不同时另留 ZIP 或源码副本。不得带第三方工具本体、源码、测试程序、构建脚本、凭据或运行数据，不默认自动启用；是否内置由桥锁定清单的 bundled 字段控制，当前四套桥内置安装包。
 - 安装包、校验文件、清单必须来自同一轮构建，文件名、版本、体积与 SHA-256 必须一致。稳定命名并覆盖同版本文件，不使用 `new`、`final`、`latest`、`copy`、`backup`、`release-v2` 或时间戳后缀。
 - 本地构建的清单必须明确尚未发布，不能沿用旧的已发布时间、远端下载地址或校验值来冒充当前包已上线。
 - 禁止出现 `.cache/`、`user/`、`data/`、`.sleepy-doll/`、`.pudding/`、`bridge-cache/`、WebView2 运行目录、日志、测试安装目录、宣传素材、提示词和临时清单。安装器编译输入与组装暂存目录归 `target/setup/`。

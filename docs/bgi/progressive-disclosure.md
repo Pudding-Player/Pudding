@@ -40,7 +40,7 @@ flowchart TD
 
 | 节点 | 简化说明 | 产出 / 下一步 |
 | --- | --- | --- |
-| 插件清单 | 读取 BGI 的技能目录和 MCP 服务配置。 | `plugins/bgi/.pudding-plugin/plugin.json`。 |
+| 插件清单 | 读取 BGI 的技能目录和 MCP 服务配置。 | `bridges/bgi/plugins/bgi/.pudding-plugin/plugin.json`。 |
 | 进程内 MCP 服务 | 在应用内提供 BGI 工具服务。 | 服务 ID 为 `bridge`，提供方为 `bgi`。 |
 | MCP 初始化说明 | 取得服务的简短操作规则。 | 登记为 `mcp-bgi-bridge` 技能。 |
 | MCP 工具清单 | 分页读取 `tools/list`，取得完整工具契约。 | 当前登记 21 个 BGI 模型工具。 |
@@ -151,7 +151,7 @@ flowchart LR
 
 ### 5.2 `bgi-assistant` 的参考节点
 
-路径均相对于 `plugins/bgi/skills/bgi-assistant/`。
+路径均相对于 `bridges/bgi/plugins/bgi/skills/bgi-assistant/`。
 
 | 参考文件 | 简化内容 |
 | --- | --- |
@@ -309,7 +309,7 @@ feature.search 对真实名称与说明做通用词项检索；保留中文词�
 
 | 位置 | 对应节点 |
 | --- | --- |
-| [插件清单](../../plugins/bgi/.pudding-plugin/plugin.json) | 技能目录、进程内 MCP 服务。 |
+| [插件清单](../../bridges/bgi/plugins/bgi/.pudding-plugin/plugin.json) | 技能目录、进程内 MCP 服务。 |
 | [应用初始化](../../src/app/mod.rs) | 注册 BGI 服务和加载插件。 |
 | [插件加载](../../src/extension/plugins.rs) / [MCP 客户端](../../src/extension/mcp.rs) | 握手、分页清单、本地工具登记。 |
 | [BGI MCP 服务](../../src/bridge/mcp.rs) | 服务说明和内部连接隔离。 |
@@ -318,9 +318,9 @@ feature.search 对真实名称与说明做通用词项检索；保留中文词�
 | [技能注册](../../src/extension/skills.rs) | 技能元数据、正文和参考文件读取。 |
 | [资料预算](../../src/runtime/host/attachments.rs) / [资料版本](../../src/runtime/working_context.rs) | 按预算装载和去重追加。 |
 | [BGI 工具定义](../../src/bridge/mod.rs) | 21 个入口及默认披露类型。 |
-| [功能卡](../../src/bridge/features.rs) / [功能索引](../../plugins/bgi/resources/feature-index.json) | 摘要搜索、单卡展开及现场分页。 |
+| [功能卡](../../src/bridge/features.rs) / [功能索引](../../bridges/bgi/plugins/bgi/resources/feature-index.json) | 摘要搜索、单卡展开及现场分页。 |
 | [检索分流](../../src/bridge/retrieval.rs) / [资源定位](../../src/bridge/resolve.rs) | 接口与资源分流、本机及仓库定位。 |
-| [JS 契约入口](../../bgi-bridge/managed/Tools/ScriptApiTools.cs) | JS 绑定搜索与成员读取。 |
+| [JS 契约入口](../../bridges/bgi/bgi-bridge/managed/Tools/ScriptApiTools.cs) | JS 绑定搜索与成员读取。 |
 | [桥执行器](../../src/runtime/host/bridge.rs) | 当前契约、版本与调用结果核对。 |
 
 验证范围：源码与文档引用核对；本文没有启动模型、执行游戏任务或改变已安装程序。
@@ -333,3 +333,10 @@ feature.search 对真实名称与说明做通用词项检索；保留中文词�
 符号检查工具接受现有名称或已发现标识，确定性解析别名、签名、返回类型及继承，汇总直接关系，分别返回完整解析、歧义和未找到。它不分类用户意图、不生成业务流程、不执行脚本。需要实现或成员细节时再按单项声明分页读取。符号和参数重命名后的关系由当前元数据决定，技能无需复制一份名称表。
 
 类型与成员来自实际编译器语法树；注入点扫描不依赖 BGI 的文件名或接收变量名。接口登记快照来自托管桥真实注册，不执行处理器。当前索引收录源码类型、成员、页面、设置及实际登记，测试问答不作为运行时资料。
+
+
+## 漏登记与 UI 最后手段
+
+常规目录没有登记某功能，不代表宿主本体没有实现。先使用源码声明定位业务类型，再通过当前目录发现 CLR 类型检索、成员描述、调用预览和一次性执行能力；这些宿主方法仍通过既有 API read/invoke 外层工具调用，不增加一套 Agent 循环。成员元数据逐项、分页展开，复杂参数或不支持的构造器明确说明，不让模型拼接私有对象。
+
+动态补足只用于常规能力缺项，不作为每次任务的前置扫描。UI 组在目录检索中排到最后；它不是动态补足的默认出口。UI 的 read/write/invoke 都需要明确用户界面要求，或本轮常规接口与 CLR 成员均不可用的真实调用证据。用户禁止界面时执行入口拒绝；看到 UI 契约不等于已获得使用许可。

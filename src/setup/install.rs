@@ -82,8 +82,8 @@ fn apply(
     Ok(())
 }
 
-/// 只检查本次会替换或迁移的程序路径，在解包与首个写入之前拒绝占用。
-fn ensure_programs_available(archive: &Archive, directory: &Path) -> Result<(), Error> {
+/// 只列出本次会替换或迁移的文件，不包括用户数据或仍由宿主使用的桥缓存。
+fn program_paths(archive: &Archive, directory: &Path) -> Vec<PathBuf> {
     let mut programs: Vec<PathBuf> = archive
         .entries()
         .iter()
@@ -102,7 +102,26 @@ fn ensure_programs_available(archive: &Archive, directory: &Path) -> Result<(), 
                 .then(|| entry.path())
         }));
     }
-    if let Some(busy) = super::uninstall::busy_program(&programs) {
+    programs
+}
+
+/// 更新前向用户列出实际待替换文件的占用者。
+pub fn blocking_programs(archive: &Archive, directory: &Path) -> Result<Vec<String>, Error> {
+    super::validate_directory(&directory.to_string_lossy())?;
+    Ok(super::uninstall::program_owners(&program_paths(
+        archive, directory,
+    )))
+}
+
+/// 仅在用户确认“关闭并更新”后调用，文件释放之前不进入更新写入阶段。
+pub fn close_blocking_programs(archive: &Archive, directory: &Path) -> Result<(), Error> {
+    super::validate_directory(&directory.to_string_lossy())?;
+    super::uninstall::close_program_files(&program_paths(archive, directory), "更新")
+}
+
+/// 在解包与首个写入之前再次检查，防止确认后程序重新启动。
+fn ensure_programs_available(archive: &Archive, directory: &Path) -> Result<(), Error> {
+    if let Some(busy) = super::uninstall::busy_program(&program_paths(archive, directory)) {
         return Err(Error::message(format!(
             "{} 正在使用中，请关闭占用它的程序后重试。",
             busy.display()

@@ -7,6 +7,9 @@ fn main() {
         "src",
         "web",
         "plugins",
+        "bridges/bgi/plugins/bgi/resources/feature-index.json",
+        "bridges/bgi/bgi-bridge/bridge.config.example.json",
+        "scripts/bridges.lock.json",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }

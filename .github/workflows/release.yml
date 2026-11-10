@@ -31,6 +31,7 @@ jobs:
   check:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.uploaded_run == '' }}
     uses: ./.github/workflows/check.yml
+    secrets: inherit
   release:
     if: ${{ always() && (needs.check.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.uploaded_run != '')) }}
     needs: check
@@ -39,6 +40,7 @@ jobs:
       contents: write
       actions: read
     env:
+      PUDDING_BRIDGE_READ_TOKEN: ${{ secrets.BRIDGE_READ_TOKEN }}
       TEMP: ${{ github.workspace }}\target\ci\tmp
       TMP: ${{ github.workspace }}\target\ci\tmp
       npm_config_cache: ${{ github.workspace }}\target\ci\npm-cache
@@ -64,7 +66,7 @@ jobs:
         env:
           RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || '' }}
         run: node scripts/release-version.mjs --github
-      - run: npm install
+      - run: npm ci
         if: ${{ inputs.uploaded_run == '' }}
       - name: Recover verified uploaded package
         if: ${{ inputs.uploaded_run != '' }}

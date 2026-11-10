@@ -8,32 +8,13 @@ $staging = Join-Path $root 'target/setup/staging'
 $distribution = Join-Path $root 'dist'
 $version = (Get-Content (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
 $installerName = "Pudding-$version-setup.exe"
-$bridgeNames = @(
-    'BgiBridge.Injector.exe', 'BgiBridge.Bootstrap.dll', 'BgiBridge.dll',
-    'BgiBridge.runtimeconfig.json', 'BgiBridge.deps.json',
-    'BgiBridge.Recovery.exe', 'BgiBridge.Recovery.dll',
-    'BgiBridge.Recovery.runtimeconfig.json', 'BgiBridge.Recovery.deps.json'
-)
+. (Join-Path $PSScriptRoot 'product-files.ps1')
 
 function Get-Sha256([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
     $algorithm = [Security.Cryptography.SHA256]::Create()
     try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
     finally { $algorithm.Dispose(); $stream.Dispose() }
-}
-
-function Get-ProductFiles {
-    [pscustomobject]@{ Relative = 'pudding.exe'; Source = (Join-Path $root 'target/release/pudding.exe') }
-    foreach ($name in $bridgeNames) {
-        [pscustomobject]@{ Relative = "bridge/$name"; Source = (Join-Path $root "target/bridge/$name") }
-    }
-    [pscustomobject]@{ Relative = 'bridge/bridge.config.example.json'; Source = (Join-Path $root 'bgi-bridge/bridge.config.example.json') }
-    foreach ($pluginName in @('bgi', 'windows-scheduler', 'web-search')) {
-        $plugins = (Resolve-Path (Join-Path $root "plugins/$pluginName")).Path
-        foreach ($file in Get-ChildItem -LiteralPath $plugins -Recurse -File) {
-            [pscustomobject]@{ Relative = ('plugins/' + $pluginName + '/' + $file.FullName.Substring($plugins.Length + 1).Replace('\', '/')); Source = $file.FullName }
-        }
-    }
 }
 
 function Remove-BuildFiles([string[]]$Paths) {
@@ -122,6 +103,8 @@ switch ($Action) {
         & (Join-Path $PSScriptRoot 'sign-windows.ps1') -Action Check -Optional
     }
     'Stage' {
+        & node (Join-Path $PSScriptRoot 'bridges.mjs') verify
+        if ($LASTEXITCODE -ne 0) { throw 'Bridge build verification failed' }
         Clear-Staging
         Copy-Product $staging
         $binaries = @(Get-ProductFiles | Where-Object { [IO.Path]::GetExtension($_.Relative) -in @('.exe', '.dll') } | ForEach-Object { Join-Path $staging $_.Relative })
@@ -145,10 +128,12 @@ switch ($Action) {
         Write-Host "Installer: $output"
     }
     'Desktop' {
+        & node (Join-Path $PSScriptRoot 'bridges.mjs') verify
+        if ($LASTEXITCODE -ne 0) { throw 'Bridge build verification failed' }
         $desktop = Join-Path $root 'target/dev/desktop'
         Copy-Product $desktop
         $config = Join-Path $desktop 'bridge/bridge.config.json'
-        if (-not (Test-Path -LiteralPath $config)) { Copy-Item -LiteralPath (Join-Path $root 'bgi-bridge/bridge.config.example.json') -Destination $config }
+        if (-not (Test-Path -LiteralPath $config)) { Copy-Item -LiteralPath (Join-Path $root 'bridges/bgi/bgi-bridge/bridge.config.example.json') -Destination $config }
         Start-Process -FilePath (Join-Path $desktop 'pudding.exe') -WorkingDirectory $desktop -WindowStyle Hidden
     }
 }

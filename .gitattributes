@@ -1,0 +1,2 @@
+packages/bridge-disclosure/*.hpp text eol=lf
+scripts/generate-adapter-disclosure.mjs text eol=lf
