@@ -280,40 +280,37 @@ async fn rejected_write_draft_is_reviewed_without_resubmission() {
 
 #[tokio::test]
 async fn plugin_rejected_submission_is_distinct_from_unknown_write() {
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest: Value = serde_json::from_slice(
-        &std::fs::read(
-            workspace.join("bridges/march7th/plugins/march7th/.pudding-plugin/plugin.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let execution: crate::extension::ToolExecution = serde_json::from_value(
-        manifest["httpTools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == "task.start")
-            .unwrap()["execution"]
-            .clone(),
-    )
+    // 通用回执语义使用自有隔离契约，不依赖已停用的可选桥仓。
+    let execution: crate::extension::ToolExecution = serde_json::from_value(json!({
+        "effect": "gameWrite",
+        "risk": "high",
+        "modelUsage": "none",
+        "concurrency": "gameExclusive",
+        "leaseScope": "game:receiptfixture",
+        "verification": "state",
+        "idempotency": "neverRetry",
+        "deferred": true,
+        "alwaysLoad": false,
+        "exposure": "afterRead",
+        "promptVisible": false
+    }))
     .unwrap();
     for rejected in [true, false] {
         let supervisor =
             super::super::record_result_tests::interrupt_supervisor("rejected-submission");
         {
             let mut config = supervisor.config.write().unwrap();
-            config.plugins.enabled = vec!["march7th".into()];
+            config.plugins.enabled = vec!["receiptfixture".into()];
             config.runtime.permission_mode = operation::permissions::PermissionMode::FullAccess;
         }
         let mut tools = ToolRegistry::default();
         tools
             .register(
                 crate::extension::FunctionTool::new(
-                    "march7th.http.task.start",
+                    "receiptfixture.http.task.start",
                     "隔离启动夹具",
                     json!({"type":"object"}),
-                    "plugin:march7th:http",
+                    "plugin:receiptfixture:http",
                     move |_| {
                         Err(if rejected {
                             Error::NotSubmitted("隔离明确拒绝".into())
@@ -333,7 +330,7 @@ async fn plugin_rejected_submission_is_distinct_from_unknown_write() {
             .unwrap();
         let call = ToolCall {
             id: "start".into(),
-            name: "march7th.http.task.start".into(),
+            name: "receiptfixture.http.task.start".into(),
             arguments: json!({}),
         };
         let bridge =
