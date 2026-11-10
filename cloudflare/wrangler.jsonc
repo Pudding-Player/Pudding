@@ -4,6 +4,7 @@
   "compatibility_date": "2026-10-03",
   "account_id": "31b280af27ff4bf0d338ecd49cf27902",
   "workers_dev": false,
+  "keep_vars": true,
   "routes": [{ "pattern": "sleepy-doll-api.restless-nh3.com", "custom_domain": true }, { "pattern": "sleepy-doll-download.restless-nh3.com", "custom_domain": true }],
   "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "sleepy-doll-releases" }],
   "ratelimits": [

@@ -2,6 +2,8 @@
 
 正式源码为当前 Git 仓库。普通提交触发检查，`v<版本>` 标签触发 Windows 安装包构建、R2 上传、GitHub Release 发布和更新通道切换。
 
+当前发布主仓为 [Pudding-Player/Pudding](https://github.com/Pudding-Player/Pudding)。Cloudflare、R2 与 GA 的发布配置在此仓库的 Actions Secrets 中维护；现有 Worker、R2 桶和兼容域名沿用。分发服务源码及部署入口变更合入 main 时自动运行 `deploy-service`，也可手动触发；服务部署不切换软件更新通道。
+
 ## 地址与资源
 
 - 官网（Vercel）：`https://sleepy-doll.restless-nh3.com`，源码见 [官网仓库](https://github.com/A-Little-AnQi/pudding-website)。
@@ -42,9 +44,11 @@
 
 GitHub Actions Secrets：`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`CLOUDFLARE_API_TOKEN`、`GA_MEASUREMENT_ID`、`GA_API_SECRET`。凭据不进入源码、安装包或发布清单。
 
+配置迁移只传输使用目标仓库公钥加密的密文，不把明文写入本地文件或日志。部署入口保留远端运行变量与现有 secrets，临时配置、Wrangler bundle、缓存与日志统一写入 `target/.tmp/cloudflare-deploy/`，结束时通过工程清理入口移除。可用 `node scripts/deploy-cloudflare.mjs --dry-run` 只校验和打包 Worker，不进行线上部署。
+
 ## 独立适配插件
 
-四套桥按 `scripts/bridges.lock.json` 获取、编译并组装到安装包；三月七、ZZZ 和 MAAEnd 默认停用。需要单独交付插件时，桥构建与隔离检查通过后，执行 `scripts/package-adapters.ps1 -Action Build`，分别组装到 `dist/bridges/march7th/plugins/march7th/`、`dist/bridges/maaend/plugins/maaend/`、`dist/bridges/zzz/plugins/zzz/`；`-Action Check` 检查文件清单、版本和 SHA-256。每个目录可单独导入，包含本插件清单、技能、原生桥、启动入口和说明，排除第三方工具、源码、测试程序、凭据及运行数据。不另生成同内容 ZIP；源码归各自 `bridges/<ID>/` 独立仓，主仓聚合输出位于 `target/bridge/`。
+四套桥按 `scripts/bridges.lock.json` 获取、编译并组装到安装包；三月七、ZZZ 和 MAAEnd 默认停用。需要单独交付插件时，桥构建与隔离检查通过后，执行 `scripts/package-adapters.ps1 -Action Build`，分别组装到 `dist/plugins/march7th/`、`dist/plugins/maaend/`、`dist/plugins/zzz/`；`-Action Check` 检查文件清单、版本和 SHA-256。每个目录可单独导入，包含本插件清单、技能、原生桥、启动入口和说明，排除第三方工具、源码、测试程序、凭据及运行数据。不另生成同内容 ZIP；源码归各自 `bridges/<ID>/` 独立仓，主仓聚合输出位于 `target/bridge/`。
 
 这些本地插件包的清单明确标记 `published:false`，不写远端下载地址或发布时间，也不改变现有 Windows 安装包的发布状态。具体连接与验收范围见各包 README 和[扩展文档](extensions.md)。
 

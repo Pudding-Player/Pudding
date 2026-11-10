@@ -1,6 +1,9 @@
 name: deploy-service
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["cloudflare/**", "scripts/deploy-cloudflare.mjs", ".github/workflows/deploy-service.yml"]
 permissions:
   contents: read
 concurrency:
