@@ -3,7 +3,7 @@ name = "pudding"
 version = "0.2.0"
 edition = "2024"
 description = "General desktop agent for game scripting tools, with a BetterGI plugin"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [features]
 default = ["desktop"]

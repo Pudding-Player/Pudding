@@ -5,7 +5,7 @@
       "id": "bgi",
       "repository": "https://github.com/Pudding-Player/Pudding-BGI-Bridge.git",
       "path": "bridges/bgi",
-      "revision": "6f1e04a7385404cdc0afa7b258cda10b7d7de37d",
+      "revision": "d004828cda74e9ab1c34ed375198d17bdbe6da59",
       "bundled": true,
       "binaries": [
         "BgiBridge.Injector.exe",
@@ -23,7 +23,7 @@
       "id": "march7th",
       "repository": "https://github.com/Pudding-Player/Pudding-March7th-Bridge.git",
       "path": "bridges/march7th",
-      "revision": "add5b222035053bc3f0cf97621ad6cd3e075b5a7",
+      "revision": "baa6a32ddb3316187b657379b5fc47b98fcb21ba",
       "bundled": true,
       "binaries": [
         "march7th_bridge.dll",
@@ -34,7 +34,7 @@
       "id": "zzz",
       "repository": "https://github.com/Pudding-Player/Pudding-ZZZ-Bridge.git",
       "path": "bridges/zzz",
-      "revision": "987305731d721894f994ab03a1702375a697dae8",
+      "revision": "d0dee43d4d0476cd43f2db7f6e6d207a71e706ec",
       "bundled": true,
       "binaries": [
         "zzz_bridge.dll",
@@ -45,7 +45,7 @@
       "id": "maaend",
       "repository": "https://github.com/Pudding-Player/Pudding-MAAEnd-Bridge.git",
       "path": "bridges/maaend",
-      "revision": "d2fa496ee1f68786db647361fb88bc1f5ec5e159",
+      "revision": "c40821152fc67366dd109f9dac8377ada8c905e8",
       "bundled": true,
       "binaries": [
         "maaend-bridge.exe"

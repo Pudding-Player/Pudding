@@ -30,4 +30,4 @@ Windows 使用 Rust stable、Node.js 22.18+、.NET 8 SDK 和 Visual Studio 2022 
 
 普通问题通过仓库 Issues 提交：附版本、复现步骤、预期与实际行为，日志先脱敏；功能请求说明使用场景。疑似安全问题按 [安全说明](SECURITY.md) 私下报告。
 
-项目代码使用 [MIT](LICENSE)。提交者应确保有权提交所含代码和资源；BetterGI、其他宿主、第三方依赖与外部资源分别遵守各自许可。
+项目代码使用 [GNU GPL v3.0（GPL-3.0-only）](LICENSE)。提交者应确保有权提交所含代码和资源；BetterGI、其他宿主、第三方依赖与外部资源分别遵守各自许可。
