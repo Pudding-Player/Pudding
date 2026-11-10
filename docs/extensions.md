@@ -10,9 +10,9 @@ Pudding 通过技能（Skill）与插件（Plugin）扩展模型能力：技能�
 - [`plugins/windows-scheduler/`](../plugins/windows-scheduler/)：随产品分发、默认关闭的定时任务插件，含独立页面、受限 MCP 接口及 AI 问答、时间解释、操作与结果判定技能。
 - [`plugins/web-search/`](../plugins/web-search/)：随产品分发、默认启用的网络搜索插件，提供原生搜索和网页读取；在插件页启停，不作为独立技能或手动命令展示。
 - [`plugins/example-weather/`](../plugins/example-weather/)：HTTP 工具示例，默认停用。
-- [`bridges/zzz/plugins/zzz/`](../bridges/zzz/plugins/zzz/)：绝区零一条龙独立反射桥与领域技能。
-- [`bridges/march7th/plugins/march7th/`](../bridges/march7th/plugins/march7th/)：三月七独立桥与领域技能。
-- [`bridges/maaend/plugins/maaend/`](../bridges/maaend/plugins/maaend/)：MaaEnd 独立桥与领域技能。
+- [`bridges/zzz/plugins/zzz/`](https://github.com/Pudding-Player/Pudding-ZZZ-Bridge/tree/main/plugins/zzz)：绝区零一条龙独立反射桥与领域技能。
+- [`bridges/march7th/plugins/march7th/`](https://github.com/Pudding-Player/Pudding-March7th-Bridge/tree/main/plugins/march7th)：三月七独立桥与领域技能。
+- [`bridges/maaend/plugins/maaend/`](https://github.com/Pudding-Player/Pudding-MAAEnd-Bridge/tree/main/plugins/maaend)：MaaEnd 独立桥与领域技能。
 
 ## 快速要点
 
