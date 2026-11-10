@@ -1390,6 +1390,13 @@ fn dispatch_ipc(
                 let _ = proxy.send_event(UserEvent::ToWeb(response));
                 return;
             }
+            "window.motionState" => {
+                let state = request.params.to_string();
+                if state.len() <= 4096 {
+                    log::info!(target: "pudding::motion", "界面动效状态：{state}");
+                }
+                return;
+            }
             "window.ready" => {
                 let _ = proxy.send_event(UserEvent::FrontendReady(
                     request.params["dark"].as_bool().unwrap_or(false),

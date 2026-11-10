@@ -1,6 +1,12 @@
 /* 共用设计变量、文档默认样式与可复用控件。页面布局在各自的页面组件旁边。 */
 
 :root {
+  --motion-fast: 120ms;
+  --motion-base: 240ms;
+  --motion-slow: 320ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-enter: cubic-bezier(0.22, 0.08, 0.16, 1);
+  --accent: #ff7a20;
   --surface: #fff;
   --sidebar: #f7f7f7;
   --subtle: #fafafa;
@@ -12,7 +18,7 @@
   --border: #e9e9e9;
   --border-strong: #cecece;
   --inverse: #fff;
-  --solid: #202020;
+  --solid: var(--accent);
   --shadow: 0 8px 30px #0000000c, 0 1px 4px #00000006;
   --well: #e6e6e6;
   --well-hover: #dcdcdc;
@@ -41,10 +47,10 @@
   --font-item: 16px;
   --font-section: 18px;
   --font-page: 24px;
-  --gold: #d09b4d;
+  --gold: #ff8a2b;
   --gold-bright: #f2dfbc;
-  --chat-user: #ff8a2b;
-  --chat-user-text: #ffffff;
+  --chat-user: var(--accent);
+  --chat-user-text: #fff;
   --chat-detail-rule: #d8d8d8;
   --chat-prose-width: 760px;
   --chat-message-meta-height: 24px;
@@ -58,7 +64,21 @@
   -webkit-font-smoothing: antialiased;
 }
 
+:root[data-reduced-motion="true"] {
+  --motion-fast: 0ms;
+  --motion-base: 0ms;
+  --motion-slow: 0ms;
+}
+
+:root[data-reduced-motion="true"] *,
+:root[data-reduced-motion="true"] *::before,
+:root[data-reduced-motion="true"] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
 :root[data-theme="dark"] {
+  --accent: #ff7a20;
   --surface: #1b1b1b;
   --sidebar: #151515;
   --subtle: #222;
@@ -69,18 +89,18 @@
   --muted: #a0a0a0;
   --border: #303030;
   --border-strong: #494949;
-  --inverse: #171717;
-  --solid: #e9e9e9;
+  --inverse: #fff;
+  --solid: var(--accent);
   --shadow: 0 8px 30px #0004, 0 1px 4px #0004;
   --well: #101010;
   --well-hover: #171717;
   --well-inset: inset 0 1px 3px #000000b3, inset 0 0 0 1px #ffffff12;
   --knob: #2c2c2c;
   --knob-shadow: 0 1px 2px #000a, 0 4px 10px #0007, inset 0 1px 0 #ffffff18;
-  --gold: #e8b26a;
+  --gold: #ff8a2b;
   --gold-bright: #f2dfbc;
-  --chat-user: #ff8a2b;
-  --chat-user-text: #ffffff;
+  --chat-user: var(--accent);
+  --chat-user-text: #fff;
   --chat-detail-rule: #3a3a3a;
   color-scheme: dark;
 }

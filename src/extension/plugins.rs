@@ -252,6 +252,9 @@ impl PluginManager {
                         continue;
                     }
                 };
+                if !providers::bridge_available(&manifest.id) {
+                    continue;
+                }
                 if manifest.schema_version != 1
                     || manifest.id.is_empty()
                     || !ids.insert(manifest.id.clone())

@@ -53,12 +53,7 @@
   }
 }
 
-/* 系统的减少动态效果设置与应用内开关都关闭动画。 */
-@media (prefers-reduced-motion: reduce) {
-  .toast {
-    animation: none;
-  }
-}
+/* 显式静态模式与共用动效策略保持一致。 */
 
 html[data-reduced-motion="true"] .toast {
   animation: none;

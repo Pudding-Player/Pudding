@@ -6,7 +6,8 @@ import { createHash } from 'node:crypto';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const check = process.argv.includes('--check');
 const selected = process.argv.find(a => a.startsWith('--plugin='))?.split('=')[1];
-const plugins = selected ? [selected] : ['march7th', 'zzz', 'maaend'];
+const bridgeLock = JSON.parse(readFileSync(resolve(root, 'scripts/bridges.lock.json'), 'utf8'));
+const plugins = selected ? [selected] : bridgeLock.bridges.filter(bridge => bridge.enabled !== false && bridge.id !== 'bgi').map(bridge => bridge.id);
 for (const id of plugins) {
   if (!['march7th', 'zzz', 'maaend'].includes(id)) throw new Error(`Unknown adapter: ${id}`);
   const base = resolve(root, 'bridges', id, 'plugins', id);

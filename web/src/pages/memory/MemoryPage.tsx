@@ -255,7 +255,6 @@ export function MemoryPage({
         compact
         className="memory-detail-dialog"
         title={current ? memoryTitle(current.entry, bootstrap) : ""}
-        initialFocus="dialog"
         onClose={() => setDetailOpen(false)}
         footer={
           current && (

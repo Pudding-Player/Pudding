@@ -9,14 +9,13 @@
   top: 0;
   right: 0;
   left: 0;
-  /* 透明条带允许侧栏字标跨入；拖动命中仍由标题栏处理，控制按钮单独接收点击。 */
+  /* 侧栏顶部条带是空 padding，条带横跨整个窗口；融进界面，不画底色和下边线。 */
   z-index: 300;
   width: 100%;
   height: var(--title-bar-height);
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  background: transparent;
   /* 窗口控制贴物理右缘，不随界面语言方向翻转。 */
   direction: ltr;
   /* 裁掉按钮悬停底色的方角。 */

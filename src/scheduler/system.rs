@@ -273,6 +273,194 @@ mod native {
         Error::Tool(format!("Windows 计划任务接口失败：{error}"))
     }
 
+    /// 只接管数据库中记录过、XML 摘要仍匹配的本产品任务。
+    pub(super) fn relocate_installation(
+        previous: &Path,
+        config: &Path,
+        executable: &Path,
+        database: &Path,
+    ) -> Result<()> {
+        use rusqlite::{Connection, OpenFlags, params};
+        let mut db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduled_tasks')", [], |row| row.get(0))?;
+        if !exists {
+            return Ok(());
+        }
+        let schedules = db
+            .prepare("SELECT payload FROM scheduled_tasks")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str::<Schedule>(&row?)?))
+            .collect::<Result<Vec<_>>>()?;
+        if schedules
+            .iter()
+            .all(|schedule| schedule.system_hash.is_none())
+        {
+            return Ok(());
+        }
+        let sid = super::administrative_identity()?;
+        let old_config = previous.canonicalize()?;
+        let backend = WindowsTasks {
+            config: config.canonicalize()?,
+            executable: executable.canonicalize()?,
+        };
+        let old_leaf =
+            super::super::digest(&(sid.clone(), old_config.to_string_lossy().to_lowercase()))?
+                [..24]
+                .to_string();
+        let new_path = backend.folder(&sid)?;
+        let new_leaf = new_path.rsplit('\\').next().expect("固定目录");
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .map_err(win_error)?;
+            struct Apartment;
+            impl Drop for Apartment {
+                fn drop(&mut self) {
+                    unsafe {
+                        CoUninitialize();
+                    }
+                }
+            }
+            let _apartment = Apartment;
+            let service: ITaskService =
+                CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER).map_err(win_error)?;
+            let empty = VARIANT::default();
+            service
+                .Connect(&empty, &empty, &empty, &empty)
+                .map_err(win_error)?;
+            let root = service.GetFolder(&BSTR::from("\\")).map_err(win_error)?;
+            let main = match root.GetFolder(&BSTR::from("Pudding")) {
+                Ok(folder) => folder,
+                Err(error) if missing(&error) => root
+                    .CreateFolder(&BSTR::from("Pudding"), &empty)
+                    .map_err(win_error)?,
+                Err(error) => return Err(win_error(error)),
+            };
+            let target = match main.GetFolder(&BSTR::from(new_leaf)) {
+                Ok(folder) => folder,
+                Err(error) if missing(&error) => main
+                    .CreateFolder(&BSTR::from(new_leaf), &empty)
+                    .map_err(win_error)?,
+                Err(error) => return Err(win_error(error)),
+            };
+            let mut plans = Vec::new();
+            for schedule in schedules
+                .into_iter()
+                .filter(|schedule| schedule.system_hash.is_some())
+            {
+                let mut found = None;
+                for name in ["Sleepy Doll", "Sleepy-Doll", "Pudding"] {
+                    let folder =
+                        match service.GetFolder(&BSTR::from(format!("\\{name}\\{old_leaf}"))) {
+                            Ok(folder) => folder,
+                            Err(error) if missing(&error) => continue,
+                            Err(error) => return Err(win_error(error)),
+                        };
+                    let task = match folder.GetTask(&BSTR::from(&schedule.id)) {
+                        Ok(task) => task,
+                        Err(error) if missing(&error) => continue,
+                        Err(error) => return Err(win_error(error)),
+                    };
+                    let xml = task.Xml().map_err(win_error)?.to_string();
+                    if schedule.system_hash.as_ref() != Some(&super::super::digest(&xml)?) {
+                        return Err(Error::Conflict(
+                            "旧系统任务已被外部修改，未替换其目录或执行入口".into(),
+                        ));
+                    }
+                    if found.is_some() {
+                        return Err(Error::Conflict(
+                            "发现重复的旧系统任务，未删除任何任务".into(),
+                        ));
+                    }
+                    found = Some((folder, xml));
+                }
+                let Some((folder, xml)) = found else {
+                    return Err(Error::Conflict(
+                        "旧系统任务不存在，用户数据保留在旧目录".into(),
+                    ));
+                };
+                if folder.Path().map_err(win_error)? != new_path.as_str() {
+                    match target.GetTask(&BSTR::from(&schedule.id)) {
+                        Ok(_) => {
+                            return Err(Error::Conflict("新目录已有同名系统任务，未覆盖".into()));
+                        }
+                        Err(error) if missing(&error) => {}
+                        Err(error) => return Err(win_error(error)),
+                    }
+                }
+                plans.push((schedule, folder, xml));
+            }
+            let transaction = db.transaction()?;
+            let mut applied = Vec::new();
+            let outcome = (|| -> Result<()> {
+                for (mut schedule, folder, old_xml) in plans {
+                    // 同时保存逆操作；数据库或后续任务失败时恢复原来的注册内容。
+                    applied.push((schedule.id.clone(), folder.clone(), old_xml));
+                    folder
+                        .DeleteTask(&BSTR::from(&schedule.id), 0)
+                        .map_err(win_error)?;
+                    let xml = backend.xml(&schedule, &sid)?;
+                    let task = target
+                        .RegisterTask(
+                            &BSTR::from(&schedule.id),
+                            &BSTR::from(xml),
+                            TASK_CREATE.0,
+                            &empty,
+                            &empty,
+                            TASK_LOGON_INTERACTIVE_TOKEN,
+                            &empty,
+                        )
+                        .map_err(win_error)?;
+                    schedule.system_hash = Some(super::super::digest(
+                        &task.Xml().map_err(win_error)?.to_string(),
+                    )?);
+                    transaction.execute(
+                        "UPDATE scheduled_tasks SET payload=?1 WHERE id=?2",
+                        params![serde_json::to_string(&schedule)?, schedule.id],
+                    )?;
+                }
+                Ok(())
+            })();
+            let outcome = outcome.and_then(|()| transaction.commit().map_err(Into::into));
+            if let Err(error) = outcome {
+                let mut failures = Vec::new();
+                for (id, folder, xml) in applied.into_iter().rev() {
+                    let _ = target.DeleteTask(&BSTR::from(&id), 0);
+                    if let Err(restore) = folder.RegisterTask(
+                        &BSTR::from(&id),
+                        &BSTR::from(xml),
+                        TASK_CREATE_OR_UPDATE.0,
+                        &empty,
+                        &empty,
+                        TASK_LOGON_INTERACTIVE_TOKEN,
+                        &empty,
+                    ) {
+                        failures.push(format!("{id}: {restore}"));
+                    }
+                }
+                if !failures.is_empty() {
+                    return Err(Error::Conflict(format!(
+                        "{error}；系统任务恢复未完成：{}",
+                        failures.join("、")
+                    )));
+                }
+                return Err(error);
+            }
+            // 删除的只是本次已腾空的任务文件夹；有其他任务时由系统拒绝删除。
+            for name in ["Sleepy Doll", "Sleepy-Doll", "Pudding"] {
+                if let Ok(parent) = root.GetFolder(&BSTR::from(name)) {
+                    if format!("\\{name}\\{old_leaf}") != new_path {
+                        let _ = parent.DeleteFolder(&BSTR::from(&old_leaf), 0);
+                    }
+                    if name != "Pudding" {
+                        let _ = root.DeleteFolder(&BSTR::from(name), 0);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn system_time(value: PrimitiveDateTime) -> SYSTEMTIME {
         SYSTEMTIME {
             wYear: value.year() as u16,
@@ -313,6 +501,23 @@ mod native {
         }
         let utc = primitive(output)?.assume_utc();
         Ok((to_local(utc)? == value).then_some(utc))
+    }
+}
+
+pub(crate) fn migrate_installation(
+    previous: &Path,
+    config: &Path,
+    executable: &Path,
+    database: &Path,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        native::relocate_installation(previous, config, executable, database)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (previous, config, executable, database);
+        Ok(())
     }
 }
 

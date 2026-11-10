@@ -1,4 +1,5 @@
 import { preference } from "./preference";
+import { motionDisabled } from "@pudding/ui/motion";
 
 export type ThemeId = "light" | "dark";
 export type ThemeOrigin = { x: number; y: number };
@@ -26,6 +27,7 @@ export function useTheme(): ThemeId {
 type Scope = HTMLElement & {
   startViewTransition?: (update: () => void) => ViewTransition;
 };
+
 type Wave = {
   transition: ViewTransition;
   animation?: Animation;
@@ -52,9 +54,27 @@ function promoteControls() {
     if (promoted.has(node) || node.matches(":popover-open")) continue;
     const box = node.getBoundingClientRect(),
       style = getComputedStyle(node);
-    const width = node.offsetWidth,
-      height = node.offsetHeight;
     const matrix = new DOMMatrixReadOnly(style.transform);
+    const padding = style.padding,
+      borderWidth = style.borderWidth,
+      borderStyle = style.borderStyle;
+    const borderBox = style.boxSizing === "border-box";
+    const width =
+        parseFloat(style.width) +
+        (borderBox
+          ? 0
+          : parseFloat(style.paddingLeft) +
+            parseFloat(style.paddingRight) +
+            parseFloat(style.borderLeftWidth) +
+            parseFloat(style.borderRightWidth)),
+      height =
+        parseFloat(style.height) +
+        (borderBox
+          ? 0
+          : parseFloat(style.paddingTop) +
+            parseFloat(style.paddingBottom) +
+            parseFloat(style.borderTopWidth) +
+            parseFloat(style.borderBottomWidth));
     const [originX = 0, originY = 0] = style.transformOrigin
       .split(" ")
       .map(parseFloat);
@@ -67,6 +87,10 @@ function promoteControls() {
       "width",
       "height",
       "margin",
+      "box-sizing",
+      "padding",
+      "border-width",
+      "border-style",
     ];
     const original = properties.map((name) => [
       name,
@@ -78,6 +102,7 @@ function promoteControls() {
     placeholder.setAttribute("aria-hidden", "true");
     if (!["absolute", "fixed"].includes(style.position)) {
       Object.assign(placeholder.style, {
+        boxSizing: "border-box",
         width: `${width}px`,
         height: `${height}px`,
         margin: style.margin,
@@ -99,6 +124,11 @@ function promoteControls() {
       width: `${width}px`,
       height: `${height}px`,
       margin: "0",
+      boxSizing: "border-box",
+      // 顶层控件保持原边框盒，阻止 popover 的默认边框和内边距改变内容尺寸。
+      padding,
+      borderWidth,
+      borderStyle,
     });
     node.showPopover();
     promoted.set(node, () => {
@@ -125,6 +155,7 @@ function releaseControls() {
 }
 
 export function writeTheme(next: ThemeId, origin?: ThemeOrigin): Promise<void> {
+  // 捕获范围限定在 body，不回退到 document/html，避免根层截获控件连点。
   const scope = document.body as Scope;
   if (wave?.to === next && readTheme() === next)
     return wave.transition.finished.catch(() => undefined);
@@ -151,7 +182,7 @@ export function writeTheme(next: ThemeId, origin?: ThemeOrigin): Promise<void> {
   wave = undefined;
   if (
     !scope.startViewTransition ||
-    matchMedia("(prefers-reduced-motion: reduce)").matches ||
+    motionDisabled() ||
     document.documentElement.dataset.theme === next
   ) {
     theme.write(next);

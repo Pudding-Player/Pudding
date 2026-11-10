@@ -5,6 +5,7 @@ pub mod payload;
 pub mod uninstall;
 
 mod cleanup;
+mod migration;
 mod registry;
 mod shell;
 
@@ -104,6 +105,12 @@ fn is_root(path: &str) -> bool {
 /// 归一化之后，结尾不是产品目录名就补一层。只看最后一段，不会二次追加。
 pub fn resolve_directory(requested: &str) -> String {
     let normalized = normalize(requested);
+    if migration::is_legacy_name(Path::new(&normalized)) {
+        return Path::new(&normalized)
+            .with_file_name(NAME)
+            .to_string_lossy()
+            .into_owned();
+    }
     if normalized.is_empty() || is_product_name(&normalized) {
         return normalized;
     }
@@ -156,11 +163,78 @@ pub fn is_foreign_directory(directory: &Path) -> bool {
 
 /// 已安装的位置与版本，取自注册表。
 pub fn installed() -> Option<Installed> {
-    let directory = registry::install_location()?;
-    Some(Installed {
-        directory,
-        version: registry::installed_version(),
+    if let Some(directory) =
+        registry::install_location().filter(|path| path.join(EXECUTABLE).is_file())
+    {
+        return Some(Installed {
+            directory,
+            version: registry::installed_version(),
+        });
+    }
+    migration::previous_installation().map(|previous| Installed {
+        directory: migration::replacement_directory(&previous.directory),
+        version: previous.version,
     })
+}
+
+pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
+    crate::data_directory::relative_path(left, right)
+        .is_some_and(|relative| relative.as_os_str().is_empty())
+}
+
+/// 完整匹配文件时后缀为空，不能 join("")，否则 Windows 会给文件名追加目录分隔符。
+pub(crate) fn append_suffix(base: &Path, suffix: &Path) -> PathBuf {
+    if suffix.as_os_str().is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(suffix)
+    }
+}
+
+/// 已移除旧目录后，兼容从旧环境变量或历史启动参数传进来的配置路径。
+pub(crate) fn relocated_legacy_config(path: &Path) -> Option<PathBuf> {
+    // 源目录在安装器退出前仍存在，旧环境变量也必须立即指向已完成迁移的新配置。
+    if let Some(directory) = registry::install_location()
+        && let Ok(bytes) = std::fs::read(directory.join("user/installation-migration.json"))
+        && let Ok(mappings) = serde_json::from_slice::<Vec<(PathBuf, PathBuf)>>(&bytes)
+        && let Some((_, target)) = mappings
+            .iter()
+            .filter_map(|(from, to)| {
+                crate::data_directory::relative_path(from, path)
+                    .map(|suffix| (from.components().count(), append_suffix(to, &suffix)))
+            })
+            .max_by_key(|(depth, _)| *depth)
+        && target.is_file()
+        && !same_path(path, &target)
+    {
+        return Some(target);
+    }
+    if path.exists() {
+        return None;
+    }
+    for ancestor in path
+        .ancestors()
+        .filter(|ancestor| migration::is_legacy_name(ancestor))
+    {
+        let suffix = crate::data_directory::relative_path(ancestor, path)?;
+        let sibling = ancestor.with_file_name(NAME).join(&suffix);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+        let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
+        if roaming.as_deref().is_some_and(|root| {
+            ancestor
+                .parent()
+                .is_some_and(|parent| same_path(parent, root))
+        }) && let Some(directory) = registry::install_location()
+        {
+            let installed = directory.join(suffix);
+            if installed.is_file() {
+                return Some(installed);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]

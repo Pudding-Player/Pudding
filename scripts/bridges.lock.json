@@ -24,32 +24,35 @@
       "repository": "https://github.com/Pudding-Player/Pudding-March7th-Bridge.git",
       "path": "bridges/march7th",
       "revision": "baa6a32ddb3316187b657379b5fc47b98fcb21ba",
-      "bundled": true,
+      "bundled": false,
       "binaries": [
         "march7th_bridge.dll",
         "march7th_injector.exe"
-      ]
+      ],
+      "enabled": false
     },
     {
       "id": "zzz",
       "repository": "https://github.com/Pudding-Player/Pudding-ZZZ-Bridge.git",
       "path": "bridges/zzz",
       "revision": "d0dee43d4d0476cd43f2db7f6e6d207a71e706ec",
-      "bundled": true,
+      "bundled": false,
       "binaries": [
         "zzz_bridge.dll",
         "zzz_injector.exe"
-      ]
+      ],
+      "enabled": false
     },
     {
       "id": "maaend",
       "repository": "https://github.com/Pudding-Player/Pudding-MAAEnd-Bridge.git",
       "path": "bridges/maaend",
       "revision": "c40821152fc67366dd109f9dac8377ada8c905e8",
-      "bundled": true,
+      "bundled": false,
       "binaries": [
         "maaend-bridge.exe"
-      ]
+      ],
+      "enabled": false
     }
   ]
 }

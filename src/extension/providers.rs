@@ -4,6 +4,24 @@
 
 use std::collections::HashSet;
 
+pub fn bridge_available(id: &str) -> bool {
+    static DISABLED: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    !DISABLED
+        .get_or_init(|| {
+            let lock: serde_json::Value =
+                serde_json::from_str(include_str!("../../scripts/bridges.lock.json"))
+                    .expect("invalid bridge lockfile");
+            lock["bridges"]
+                .as_array()
+                .expect("bridge list")
+                .iter()
+                .filter(|bridge| bridge["enabled"] == false)
+                .filter_map(|bridge| bridge["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .contains(id)
+}
+
 /// 随产品提供的宿主提供方：工具名 `bgi.*` 与 source `core:bgi` 都归它。
 pub const HOST_PROVIDER: &str = "bgi";
 pub const WEB_PROVIDER: &str = "web-search";
@@ -22,10 +40,11 @@ pub fn is_host_provider(id: &str) -> bool {
 }
 
 pub fn is_bundled_plugin(id: &str) -> bool {
-    matches!(
-        id,
-        "bgi" | "windows-scheduler" | WEB_PROVIDER | "march7th" | "zzz" | "maaend"
-    )
+    bridge_available(id)
+        && matches!(
+            id,
+            "bgi" | "windows-scheduler" | WEB_PROVIDER | "march7th" | "zzz" | "maaend"
+        )
 }
 
 /// 宿主插件默认开启，写进 `plugins.disabled` 才算关掉。
@@ -35,6 +54,9 @@ pub fn host_plugin_enabled(disabled: &[String]) -> bool {
 
 /// 宿主和联网插件默认开启；其余插件须显式启用。
 pub fn plugin_enabled(id: &str, enabled: &[String], disabled: &[String]) -> bool {
+    if !bridge_available(id) {
+        return false;
+    }
     if is_default_enabled_plugin(id) {
         return !disabled.iter().any(|entry| entry == id);
     }

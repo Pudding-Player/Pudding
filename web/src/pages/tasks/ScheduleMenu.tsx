@@ -35,11 +35,6 @@ export function ScheduleMenu({
   }, [open, present, point]);
   useEffect(() => {
     if (!open) return;
-    const frame = requestAnimationFrame(() =>
-      panel.current
-        ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
-        ?.focus({ preventScroll: true }),
-    );
     const outside = (event: PointerEvent) => {
       const target = event.target as Node;
       if (!panel.current?.contains(target) && !anchor.current?.contains(target))
@@ -60,7 +55,6 @@ export function ScheduleMenu({
     document.addEventListener("scroll", scroll, true);
     window.addEventListener("resize", onClose);
     return () => {
-      cancelAnimationFrame(frame);
       document.removeEventListener("pointerdown", outside, true);
       document.removeEventListener("keydown", escape, true);
       document.removeEventListener("scroll", scroll, true);

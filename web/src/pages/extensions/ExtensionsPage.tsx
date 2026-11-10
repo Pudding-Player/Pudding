@@ -253,7 +253,6 @@ export function ExtensionsPage({
         open={open}
         compact
         className="extensions-dialog"
-        initialFocus={install ? "field" : "dialog"}
         onClose={() => setOpen(false)}
         title={
           install

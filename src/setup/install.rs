@@ -36,6 +36,10 @@ fn apply(
     desktop_shortcut: Option<bool>,
     progress: Progress,
 ) -> Result<(), Error> {
+    super::validate_directory(&directory.to_string_lossy())?;
+    if super::migration::required(directory) {
+        super::uninstall::close_program_files(&program_paths(archive, directory), "迁移")?;
+    }
     ensure_programs_available(archive, directory)?;
     let updating = desktop_shortcut.is_none();
     progress(
@@ -48,6 +52,9 @@ fn apply(
     );
     let staging = Staging::create()?;
     extract(&staging.0, archive)?;
+
+    progress(0.45, "正在迁移旧版配置与数据…");
+    let mut legacy = super::migration::Migration::prepare(directory)?;
 
     progress(0.5, "正在写入文件…");
     let mut written = Written::new(directory);
@@ -70,6 +77,9 @@ fn apply(
         written.rollback();
         return Err(written.describe(error));
     }
+
+    // 新程序和配置就绪后才撤销旧登记并安排退出后的清理。
+    legacy.finish()?;
 
     progress(
         1.0,
@@ -117,6 +127,10 @@ pub fn blocking_programs(archive: &Archive, directory: &Path) -> Result<Vec<Stri
 pub fn close_blocking_programs(archive: &Archive, directory: &Path) -> Result<(), Error> {
     super::validate_directory(&directory.to_string_lossy())?;
     super::uninstall::close_program_files(&program_paths(archive, directory), "更新")
+}
+
+pub fn is_legacy_upgrade(directory: &Path) -> bool {
+    super::migration::required(directory)
 }
 
 /// 在解包与首个写入之前再次检查，防止确认后程序重新启动。
@@ -223,7 +237,10 @@ impl Written {
 /// 旧版把桥的文件平铺在根下、技能放在根下的 `skills\`，装载新布局的包时把它们归位。
 /// 载荷自己还是旧布局时不动。
 fn migrate(archive: &Archive, directory: &Path) -> Result<(), Error> {
-    super::remove_retired_skills(archive, directory);
+    // 更名接管时保留完整旧树，不能把用户曾自行放入根 skills 的内容一起丢弃。
+    if !super::migration::required(directory) {
+        super::remove_retired_skills(archive, directory);
+    }
     if bridge_directory(archive).is_none() {
         return Ok(());
     }

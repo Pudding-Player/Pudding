@@ -2,6 +2,7 @@
 
 pub use platform::{
     browse_for_directory, create_shortcut, desktop_directory, launch, programs_directory,
+    shortcut_target,
 };
 
 #[cfg(windows)]
@@ -73,7 +74,7 @@ mod platform {
             unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
         add_ref: *const c_void,
         release: unsafe extern "system" fn(*mut c_void) -> u32,
-        get_path: *const c_void,
+        get_path: unsafe extern "system" fn(*mut c_void, *mut u16, i32, *mut c_void, u32) -> i32,
         get_id_list: *const c_void,
         set_id_list: *const c_void,
         get_description: *const c_void,
@@ -102,7 +103,7 @@ mod platform {
         release: unsafe extern "system" fn(*mut c_void) -> u32,
         get_class_id: *const c_void,
         is_dirty: *const c_void,
-        load: *const c_void,
+        load: unsafe extern "system" fn(*mut c_void, *const u16, u32) -> i32,
         save: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> i32,
     }
 
@@ -166,6 +167,55 @@ mod platform {
             )));
         }
         Ok(())
+    }
+
+    pub fn shortcut_target(link: &Path) -> Result<Option<PathBuf>, Error> {
+        let _apartment = Apartment::join()?;
+        let mut raw = ptr::null_mut();
+        let result = unsafe {
+            CoCreateInstance(
+                &CLSID_SHELL_LINK,
+                ptr::null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_SHELL_LINK_W,
+                &mut raw,
+            )
+        };
+        if result < 0 || raw.is_null() {
+            return Err(Error::message("无法读取旧快捷方式对象"));
+        }
+        let _object = Interface(raw);
+        let vtable = unsafe { *(raw as *const *const ShellLinkVtable) };
+        let mut persist = ptr::null_mut();
+        let result = unsafe { ((*vtable).query_interface)(raw, &IID_PERSIST_FILE, &mut persist) };
+        if result < 0 || persist.is_null() {
+            return Err(Error::message("无法读取旧快捷方式"));
+        }
+        let _persist = Interface(persist);
+        let persist_vtable = unsafe { *(persist as *const *const PersistFileVtable) };
+        let filename = wide(link.as_os_str());
+        let result = unsafe { ((*persist_vtable).load)(persist, filename.as_ptr(), 0) };
+        if result < 0 {
+            return Err(Error::message(format!("无法读取 {}", link.display())));
+        }
+        let mut target = vec![0u16; 32768];
+        let result = unsafe {
+            ((*vtable).get_path)(
+                raw,
+                target.as_mut_ptr(),
+                target.len() as i32,
+                ptr::null_mut(),
+                4,
+            )
+        };
+        if result < 0 {
+            return Err(Error::message("无法读取旧快捷方式目标"));
+        }
+        let length = target
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(target.len());
+        Ok((length > 0).then(|| PathBuf::from(String::from_utf16_lossy(&target[..length]))))
     }
 
     /// 经外壳启动一个程序，由系统弹 UAC。
@@ -287,6 +337,10 @@ mod platform {
 
     pub fn create_shortcut(_link: &Path, _target: &Path, _arguments: &str) -> Result<(), Error> {
         Ok(())
+    }
+
+    pub fn shortcut_target(_: &Path) -> Result<Option<PathBuf>, Error> {
+        Ok(None)
     }
 
     pub fn launch(_executable: &Path) -> Result<(), Error> {

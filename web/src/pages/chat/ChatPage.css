@@ -178,13 +178,6 @@
   transform: none;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .run-plan-motion {
-    transition: none;
-    transform: none;
-  }
-}
-
 .run-approval h3,
 .run-error h3 {
   margin: 0 0 10px;

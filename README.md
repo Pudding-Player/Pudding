@@ -35,9 +35,9 @@
 | 工具 | 游戏 | 桥源码 | 状态 |
 | --- | --- | --- | --- |
 | [BetterGI](https://github.com/babalae/better-genshin-impact) | 原神 | [Pudding-BGI-Bridge](https://github.com/Pudding-Player/Pudding-BGI-Bridge) | 已适配 |
-| [三月七小助手](https://github.com/moesnow/March7thAssistant) | 崩坏：星穹铁道 | [Pudding-March7th-Bridge](https://github.com/Pudding-Player/Pudding-March7th-Bridge) | 随安装包内置，默认停用 |
-| [ZZZ一条龙](https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon) | 绝区零 | [Pudding-ZZZ-Bridge](https://github.com/Pudding-Player/Pudding-ZZZ-Bridge) | 随安装包内置，默认停用 |
-| [MaaEnd](https://github.com/MaaEnd/MaaEnd) | 明日方舟：终末地 | [Pudding-MAAEnd-Bridge](https://github.com/Pudding-Player/Pudding-MAAEnd-Bridge) | 随安装包内置，默认停用 |
+| [三月七小助手](https://github.com/moesnow/March7thAssistant) | 崩坏：星穹铁道 | [Pudding-March7th-Bridge](https://github.com/Pudding-Player/Pudding-March7th-Bridge) | 暂时停用，不随安装包分发 |
+| [ZZZ一条龙](https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon) | 绝区零 | [Pudding-ZZZ-Bridge](https://github.com/Pudding-Player/Pudding-ZZZ-Bridge) | 暂时停用，不随安装包分发 |
+| [MaaEnd](https://github.com/MaaEnd/MaaEnd) | 明日方舟：终末地 | [Pudding-MAAEnd-Bridge](https://github.com/Pudding-Player/Pudding-MAAEnd-Bridge) | 暂时停用，不随安装包分发 |
 
 各工具是独立项目，由其原项目维护；桥不会自动启动工具或游戏。
 

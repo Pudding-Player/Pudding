@@ -7,6 +7,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { ClockIcon, PlusIcon, ToolIcon } from "@pudding/ui/icons";
+import { motionDisabled } from "@pudding/ui/motion";
 import type { SkillInfo } from "../../ipc/types";
 import "./SkillMenu.css";
 
@@ -115,10 +116,7 @@ export function SkillMenu({
       if (current === "closed") return current;
       return "closing";
     });
-    if (
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches
-    ) {
+    if (motionDisabled()) {
       setPhase("closed");
       setPlaced(false);
       return;
@@ -199,10 +197,6 @@ export function SkillMenu({
     window.addEventListener("resize", close);
     document.addEventListener("pointerdown", onDown);
     document.addEventListener("keydown", onKey);
-    // slash 模式焦点必须留在输入框里打筛选词，只有按钮模式把焦点交给菜单。
-    // 聚焦要等面板挂载并定位完成（placed + opening），首帧 menu.current 还是 null。
-    if (!slashOpen && placed && phase === "opening")
-      menu.current?.querySelector<HTMLButtonElement>("button")?.focus();
     return () => {
       document.removeEventListener("pointerdown", onDown);
       document.removeEventListener("keydown", onKey);

@@ -16,8 +16,9 @@ const ids = ['bgi', 'march7th', 'zzz', 'maaend'];
 if (lock.schemaVersion !== 1 || lock.bridges.length !== ids.length || new Set(lock.bridges.map(b => b.id)).size !== ids.length) throw Error('Invalid bridge lockfile');
 for (const bridge of lock.bridges) {
   if (!ids.includes(bridge.id) || bridge.path !== `bridges/${bridge.id}` || !/^https:\/\/github\.com\/Pudding-Player\/Pudding-[A-Za-z0-9-]+-Bridge\.git$/.test(bridge.repository)) throw Error('Invalid bridge repository mapping');
-  if (typeof bridge.bundled !== 'boolean' || !Array.isArray(bridge.binaries) || bridge.binaries.some(name => !/^[A-Za-z0-9_.-]+$/.test(name))) throw Error('Invalid bridge payload mapping');
+  if ((bridge.enabled !== undefined && typeof bridge.enabled !== 'boolean') || typeof bridge.bundled !== 'boolean' || !Array.isArray(bridge.binaries) || bridge.binaries.some(name => !/^[A-Za-z0-9_.-]+$/.test(name))) throw Error('Invalid bridge payload mapping');
 }
+const activeBridges = lock.bridges.filter(bridge => bridge.enabled !== false);
 // A CI secret is passed only through Git's process environment, never persisted in remotes.
 const gitEnv = { ...env };
 if (gitEnv.PUDDING_BRIDGE_READ_TOKEN) {
@@ -104,7 +105,7 @@ function sourceFiles(directory, prefix) {
 }
 function productFiles() {
   const files = [];
-  for (const bridge of lock.bridges.filter(b => b.bundled)) {
+  for (const bridge of activeBridges.filter(b => b.bundled)) {
     const source = plugin(bridge);
     const manifest = resolve(source, '.pudding-plugin/plugin.json');
     noLinks(manifest);
@@ -119,7 +120,7 @@ function productFiles() {
 function verify() {
   const state = JSON.parse(readFileSync(statePath, 'utf8'));
   if (state.schemaVersion !== 1) throw Error('Invalid bridge build manifest');
-  for (const bridge of lock.bridges.filter(b => b.bundled)) {
+  for (const bridge of activeBridges.filter(b => b.bundled)) {
     const current = inspect(bridge);
     const built = state.bridges.find(b => b.id === bridge.id);
     if (!built || !current || built.revision !== current.revision || built.sourceHash !== fingerprint(bridge)) throw Error(`Bridge source changed after build: ${bridge.id}`);
@@ -135,11 +136,11 @@ function verify() {
 try {
   if (options.some(option => option !== '--locked')) throw Error('Only --locked is supported');
   if (action === 'status') {
-    for (const bridge of lock.bridges) console.log(JSON.stringify({ id: bridge.id, path: bridge.path, pinned: bridge.revision, ...inspect(bridge) }));
+    for (const bridge of lock.bridges) console.log(JSON.stringify({ id: bridge.id, enabled: bridge.enabled !== false, path: bridge.path, pinned: bridge.revision, ...inspect(bridge) }));
   } else if (action === 'fetch' || action === 'ensure') {
-    for (const bridge of lock.bridges) { const state = ensure(bridge); console.log(`${bridge.id}: ${state.revision}${state.dirty ? ' (local changes preserved)' : ''}`); }
+    for (const bridge of activeBridges) { const state = ensure(bridge); console.log(`${bridge.id}: ${state.revision}${state.dirty ? ' (local changes preserved)' : ''}`); }
   } else if (action === 'lock') {
-    for (const bridge of lock.bridges) {
+    for (const bridge of activeBridges) {
       const state = inspect(bridge);
       if (!state || state.dirty) throw Error(`Commit ${bridge.id} before locking it`);
       const remote = command('git', ['ls-remote', bridge.repository, 'refs/heads/main']).split(/\s+/)[0];
@@ -148,7 +149,7 @@ try {
     }
     writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n');
   } else if (action === 'prepare') {
-    for (const bridge of lock.bridges) ensure(bridge);
+    for (const bridge of activeBridges) ensure(bridge);
     for (const file of productFiles().filter(file => file.Relative.startsWith('plugins/') && !file.Relative.includes('/bridge/'))) {
       const destination = resolve(root, 'target/dev', file.Relative);
       noLinks(destination);
@@ -170,10 +171,10 @@ try {
   else if (action === 'verify') { verify(); console.log('Bridge sources and compiled payloads verified.'); }
   else if (action === 'build') {
     if (process.platform !== 'win32') throw Error('Bridge production builds require Windows');
-    for (const bridge of lock.bridges) ensure(bridge);
+    for (const bridge of activeBridges) ensure(bridge);
     command(process.execPath, [resolve(root, 'scripts/generate-adapter-disclosure.mjs'), '--check']);
     const built = [];
-    for (const bridge of lock.bridges) {
+    for (const bridge of activeBridges) {
       const source = resolve(root, bridge.path);
       const entry = bridge.id === 'bgi' ? 'bgi-bridge\\build.cmd' : `plugins\\${bridge.id}\\bridge\\build.cmd`;
       console.log(`Building ${bridge.id}...`);

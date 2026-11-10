@@ -1,5 +1,4 @@
 import {
-  useEffect,
   useId,
   useLayoutEffect,
   useMemo,
@@ -82,47 +81,6 @@ export function UpdateDialog({
   useLayoutEffect(() => {
     if (open && body.current) body.current.scrollTop = 0;
   }, [tab, open]);
-  useEffect(() => {
-    if (!open) return;
-    const previous = document.activeElement;
-    const timer = window.setTimeout(() => {
-      body.current
-        ?.closest(".sd-dialog")
-        ?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')
-        ?.focus({ preventScroll: true });
-    }, 0);
-    const keepFocus = (event: KeyboardEvent) => {
-      if (event.key !== "Tab") return;
-      const dialog = body.current?.closest(".sd-dialog");
-      if (!dialog) return;
-      const controls = Array.from(
-        dialog.querySelectorAll<HTMLElement>(
-          'button:not([disabled]):not([tabindex="-1"]), a[href], [tabindex="0"]',
-        ),
-      );
-      const first = controls[0];
-      const last = controls[controls.length - 1];
-      if (!first || !last) return;
-      if (!dialog.contains(document.activeElement)) {
-        event.preventDefault();
-        (event.shiftKey ? last : first).focus();
-      } else if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", keepFocus);
-    return () => {
-      window.clearTimeout(timer);
-      document.removeEventListener("keydown", keepFocus);
-      if (previous instanceof HTMLElement && previous.isConnected) {
-        previous.focus({ preventScroll: true });
-      }
-    };
-  }, [open]);
   if (!active) return null;
   return (
     <Dialog

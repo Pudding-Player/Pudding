@@ -129,7 +129,11 @@ export default function App() {
     void reload();
     restoreTheme();
     restoreLocale();
-    delete document.documentElement.dataset.reducedMotion;
+    if (Boolean((window as { __VIDEO__?: unknown }).__VIDEO__)) {
+      document.documentElement.dataset.reducedMotion = "true";
+    } else {
+      delete document.documentElement.dataset.reducedMotion;
+    }
     localStorage.removeItem("pudding-reduced-motion");
   }, [reload]);
 
@@ -177,8 +181,7 @@ export default function App() {
       setReleaseNotesOpen(true);
     };
     window.addEventListener("pudding:open-release-notes", open);
-    return () =>
-      window.removeEventListener("pudding:open-release-notes", open);
+    return () => window.removeEventListener("pudding:open-release-notes", open);
   }, []);
 
   useEffect(() => {

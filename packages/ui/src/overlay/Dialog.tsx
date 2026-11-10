@@ -21,7 +21,6 @@ export function Dialog({
   footer,
   compact = false,
   className = "",
-  initialFocus = "field",
 }: {
   title: string;
   subtitle?: ReactNode;
@@ -31,7 +30,6 @@ export function Dialog({
   footer?: ReactNode;
   compact?: boolean;
   className?: string;
-  initialFocus?: "field" | "dialog";
 }) {
   const t = useT();
   const titleId = useId();
@@ -39,7 +37,12 @@ export function Dialog({
   const panel = useRef<HTMLDivElement>(null);
   const close = useRef(onClose);
   close.current = onClose;
-  const present = usePresence(open, layer, { content: panel, y: 6, scale: 1 });
+  const present = usePresence(open, layer, {
+    content: panel,
+    y: 8,
+    scale: 0.985,
+    duration: 320,
+  });
   const snapshot = useRef({ title, subtitle, children, footer });
   useLayoutEffect(() => {
     if (open || !present)
@@ -55,18 +58,9 @@ export function Dialog({
     const focusable = () =>
       [
         ...(layer.current?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex="0"]',
+          'button:not(:disabled):not([tabindex="-1"]), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href]:not([tabindex="-1"]), [tabindex="0"]',
         ) ?? []),
       ].filter((node) => node.getClientRects().length > 0);
-    const frame = requestAnimationFrame(() => {
-      if (initialFocus === "dialog") {
-        panel.current?.focus({ preventScroll: true });
-        return;
-      }
-      const field =
-        layer.current?.querySelector<HTMLElement>("input, textarea");
-      (field ?? focusable()[0])?.focus({ preventScroll: true });
-    });
     const onKey = (event: KeyboardEvent) => {
       if (
         layer.current !==
@@ -84,7 +78,10 @@ export function Dialog({
         const items = focusable(),
           first = items[0],
           last = items.at(-1);
-        if (
+        if (!layer.current?.contains(document.activeElement)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first)?.focus();
+        } else if (
           event.shiftKey &&
           (document.activeElement === first ||
             document.activeElement === panel.current)
@@ -99,11 +96,10 @@ export function Dialog({
     };
     document.addEventListener("keydown", onKey);
     return () => {
-      cancelAnimationFrame(frame);
       document.removeEventListener("keydown", onKey);
       if (previous?.isConnected) previous.focus({ preventScroll: true });
     };
-  }, [open, initialFocus]);
+  }, [open]);
 
   if (!present) return null;
   return createPortal(

@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [ValidateSet('Build', 'Check')][string]$Action = 'Check',
-    [ValidateSet('march7th', 'maaend', 'zzz')][string[]]$Plugin = @('march7th', 'maaend', 'zzz')
+    [ValidateSet('march7th', 'maaend', 'zzz')][string[]]$Plugin = @()
 )
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -14,6 +14,10 @@ $binaries = @{
 }
 $ports = @{march7th=23111; maaend=23121; zzz=23101}
 $tokenNames = @{march7th='MARCH7TH_BRIDGE_TOKEN'; maaend='MAAEND_BRIDGE_TOKEN'; zzz='ZZZ_BRIDGE_TOKEN'}
+if (-not $Plugin.Count) {
+    $lock = Get-Content -LiteralPath (Join-Path $root 'scripts/bridges.lock.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $Plugin = @($lock.bridges | Where-Object { $_.id -ne 'bgi' -and $_.enabled -ne $false } | ForEach-Object { $_.id })
+}
 
 function Get-Sha256([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)

@@ -1,6 +1,5 @@
 /** 动画数值留在浏览器动画引擎中，React 只提交交互状态。 */
 const active = new WeakMap<HTMLElement, Animation>();
-let reduced: MediaQueryList | undefined;
 const springs = new WeakMap<
   HTMLElement,
   {
@@ -11,9 +10,10 @@ const springs = new WeakMap<
   }
 >();
 export function motionDisabled() {
+  // 产品动效默认启用；仅显式静态呈现模式可以关闭，组件不各自读取系统偏好。
   return (
     Boolean((window as { __VIDEO__?: unknown }).__VIDEO__) ||
-    (reduced ??= window.matchMedia("(prefers-reduced-motion: reduce)")).matches
+    document.documentElement.dataset.reducedMotion === "true"
   );
 }
 
@@ -28,11 +28,27 @@ export function cancelVisual(node: HTMLElement | null) {
 export function animateVisual(
   node: HTMLElement,
   target: { opacity: number; y?: number; scale?: number },
-  duration = 180,
+  duration = 240,
 ) {
   // 在取消旧动画、写入新目标之前采样真实呈现值，支持连续反向。
   const current = getComputedStyle(node);
   const from = { opacity: current.opacity, transform: current.transform };
+  const easing =
+    current.getPropertyValue("--ease-enter").trim() ||
+    "cubic-bezier(0.22,0.08,0.16,1)";
+  // 接管同一元素的入场属性，避免 CSS 填充态在 JS 退场结束时把它重新显示出来。
+  const cssMotions = node
+    .getAnimations()
+    .filter(
+      (animation) =>
+        typeof CSSAnimation !== "undefined" &&
+        animation instanceof CSSAnimation &&
+        animation.effect instanceof KeyframeEffect &&
+        animation.effect
+          .getKeyframes()
+          .some((frame) => "opacity" in frame || "transform" in frame),
+    );
+  for (const animation of cssMotions) animation.cancel();
   cancelVisual(node);
   node.style.opacity = String(target.opacity);
   node.style.transform =
@@ -43,7 +59,7 @@ export function animateVisual(
     return Promise.resolve();
   const animation = node.animate(
     [from, { opacity: node.style.opacity, transform: node.style.transform }],
-    { duration, easing: "cubic-bezier(0.2,0,0,1)" },
+    { duration, easing },
   );
   active.set(node, animation);
   return animation.finished.then(() => {

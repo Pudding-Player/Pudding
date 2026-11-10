@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: '发布通道（正式版 stable / 测试版 test）'
+        description: '发布通道（稳定版 stable / 测试版 test）'
         required: true
         type: choice
         default: stable

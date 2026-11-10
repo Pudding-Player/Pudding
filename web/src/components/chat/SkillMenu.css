@@ -104,8 +104,3 @@
   animation: skill-menu-out 120ms ease both;
   pointer-events: none;
 }
-@media (prefers-reduced-motion: reduce) {
-  .skill-menu-popover[data-state][data-side] {
-    animation: none;
-  }
-}

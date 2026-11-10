@@ -390,10 +390,3 @@
 .pending-request-layer:has(> .pending-question:only-child) {
   overflow-y: clip;
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .pending-question-motion,
-  .pending-question > .pending-request-chip {
-    transition: none;
-  }
-}

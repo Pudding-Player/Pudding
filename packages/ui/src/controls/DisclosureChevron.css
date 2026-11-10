@@ -27,9 +27,3 @@ svg.sd-chevron {
 :root[data-reduced-motion="true"] .sd-chevron {
   transition: none;
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .sd-chevron {
-    transition: none;
-  }
-}

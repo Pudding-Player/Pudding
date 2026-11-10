@@ -231,12 +231,15 @@ export function useConversationScroll(
     root.addEventListener("touchstart", onTouchStart, { passive: true });
     root.addEventListener("touchmove", onTouchMove, { passive: true });
     document.addEventListener("selectionchange", onSelection);
-    const media = matchMedia("(prefers-reduced-motion: reduce)");
     const preference = () => {
       reduced = motionDisabled();
       request();
     };
-    media.addEventListener("change", preference);
+    const motionPreference = new MutationObserver(preference);
+    motionPreference.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-reduced-motion"],
+    });
     latest.current = () => {
       position = root.scrollTop;
       velocity = 0;
@@ -257,7 +260,7 @@ export function useConversationScroll(
       root.removeEventListener("touchstart", onTouchStart);
       root.removeEventListener("touchmove", onTouchMove);
       document.removeEventListener("selectionchange", onSelection);
-      media.removeEventListener("change", preference);
+      motionPreference.disconnect();
       latest.current = () => {};
     };
   }, [viewKey, loading, scroll, flow, dock, follow]);

@@ -1,4 +1,5 @@
 import { useLayoutEffect, useRef, type ReactNode } from "react";
+import { motionDisabled } from "../motion";
 import "./SlidingTabs.css";
 
 export function SlidingTabs<T extends string>({
@@ -63,12 +64,10 @@ export function SlidingTabs<T extends string>({
       prev.top === next.top &&
       prev.height === next.height;
     // 影片页（capture query / 固定时钟 film）：墙钟动画不得影响帧渲染，确定性落位。
-    const film =
-      typeof window !== "undefined" &&
-      Boolean((window as { __VIDEO__?: unknown }).__VIDEO__);
+    const disabled = motionDisabled();
     if (same && marker.dataset.ready === "true") {
       // 几何未变：不打断进行中的 200ms 过渡（ResizeObserver 初次回调/无变化触发）。
-      if (film && typeof marker.getAnimations === "function")
+      if (disabled && typeof marker.getAnimations === "function")
         for (const animation of marker.getAnimations()) animation.cancel();
       return;
     }
@@ -80,10 +79,7 @@ export function SlidingTabs<T extends string>({
     marker.style.width = `${next.width}px`;
     marker.style.height = `${next.height}px`;
     marker.dataset.ready = "true";
-    const reduced =
-      typeof matchMedia === "function" &&
-      matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (!animate || film || reduced || !prev) {
+    if (!animate || disabled || !prev) {
       if (typeof marker.getAnimations === "function")
         for (const animation of marker.getAnimations()) animation.cancel();
       return;

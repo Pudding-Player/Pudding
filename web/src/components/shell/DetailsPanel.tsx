@@ -272,7 +272,6 @@ export function DetailsPanel({
         <label className="shortcut-name-field">
           任务名称
           <input
-            autoFocus
             value={newName}
             onChange={(event) => setNewName(event.target.value)}
             maxLength={120}

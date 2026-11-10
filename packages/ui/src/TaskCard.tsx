@@ -93,11 +93,6 @@ export function TaskCard<T extends TaskCardData>({
   }, [menu, menuPoint]);
   useEffect(() => {
     if (!menu) return;
-    const frame = requestAnimationFrame(() =>
-      panel.current
-        ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
-        ?.focus({ preventScroll: true }),
-    );
     const close = (event: PointerEvent) => {
       if (
         !container.current?.contains(event.target as Node) &&
@@ -123,7 +118,6 @@ export function TaskCard<T extends TaskCardData>({
     document.addEventListener("scroll", scroll, true);
     window.addEventListener("resize", resize);
     return () => {
-      cancelAnimationFrame(frame);
       document.removeEventListener("pointerdown", close, true);
       document.removeEventListener("keydown", escape, true);
       document.removeEventListener("scroll", scroll, true);

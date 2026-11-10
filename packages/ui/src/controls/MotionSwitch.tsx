@@ -16,16 +16,16 @@ export function MotionSwitch({
   className?: string;
 }) {
   const root = useRef<HTMLDivElement>(null);
-  const initialized = useRef(false);
   useLayoutEffect(() => {
     const node = root.current;
     if (!node) return;
     if (!node.getAnimations().length) {
-      node.style.opacity = initialized.current ? "0.96" : "0";
-      node.style.transform = `translateY(${kind === "page" ? 6 : 4}px)`;
+      node.style.opacity = "0";
+      node.style.transform = `translateY(${kind === "page" ? 8 : 6}px)`;
     }
-    initialized.current = true;
-    void animateVisual(node, { opacity: 1 }, 200).catch(() => {});
+    void animateVisual(node, { opacity: 1 }, kind === "page" ? 320 : 240).catch(
+      () => {},
+    );
   }, [viewKey, kind]);
   useLayoutEffect(() => {
     const node = root.current;

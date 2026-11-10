@@ -304,12 +304,3 @@
     padding: 18px 22px 24px;
   }
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .update-dialog-article {
-    animation: none;
-  }
-  .update-dialog-tabs button {
-    transition: none;
-  }
-}

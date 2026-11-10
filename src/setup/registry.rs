@@ -1,9 +1,16 @@
 //! 每用户的卸载登记项。控制面板的「程序和功能」按它显示与卸载，写在 HKCU 下。
 
-pub use platform::{install_location, installed_version, register, remove};
+pub use platform::{
+    install_location, installed_version, legacy_installations, register, relocate_environment,
+    remove, remove_legacy,
+};
 
 /// 登记项的子键。
 const KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Pudding";
+const LEGACY_KEYS: [&str; 2] = [
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Sleepy Doll",
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Sleepy-Doll",
+];
 
 #[cfg(windows)]
 mod platform {
@@ -23,7 +30,7 @@ mod platform {
 
     use crate::setup::{EXECUTABLE, Error, NAME, UNINSTALLER, version};
 
-    use super::KEY;
+    use super::{KEY, LEGACY_KEYS};
 
     /// 写入登记项。`directory` 是安装目录。
     pub fn register(directory: &Path) -> Result<(), Error> {
@@ -50,7 +57,67 @@ mod platform {
 
     /// 删除整个登记项，子键一并删掉。
     pub fn remove() -> Result<(), Error> {
-        let subkey = wide(KEY);
+        remove_key(KEY)
+    }
+
+    pub fn remove_legacy(directory: &Path) -> Result<(), Error> {
+        for key in LEGACY_KEYS {
+            if read_key_text(key, "InstallLocation")
+                .is_some_and(|location| crate::setup::same_path(Path::new(&location), directory))
+            {
+                remove_key(key)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn relocate_environment(mappings: &[(PathBuf, PathBuf)]) -> Result<(), Error> {
+        let mut changed = false;
+        for variable in ["PUDDING_CONFIG", "SLEEPY_DOLL_CONFIG"] {
+            let Some(value) = read_key_text(r"Environment", variable) else {
+                continue;
+            };
+            let original = Path::new(&value);
+            if let Some((_, destination)) = mappings
+                .iter()
+                .filter_map(|(from, to)| {
+                    crate::data_directory::relative_path(from, original).map(|suffix| {
+                        (
+                            from.components().count(),
+                            crate::setup::append_suffix(to, &suffix),
+                        )
+                    })
+                })
+                .max_by_key(|(depth, _)| *depth)
+                && !crate::setup::same_path(original, &destination)
+            {
+                Key::create_at(r"Environment")?
+                    .set_text(variable, &destination.to_string_lossy())?;
+                changed = true;
+            }
+        }
+        if changed {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+            };
+            let environment = wide("Environment");
+            unsafe {
+                SendMessageTimeoutW(
+                    HWND_BROADCAST,
+                    WM_SETTINGCHANGE,
+                    0,
+                    environment.as_ptr() as isize,
+                    SMTO_ABORTIFHUNG,
+                    1000,
+                    ptr::null_mut(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_key(name: &str) -> Result<(), Error> {
+        let subkey = wide(name);
         let result = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr()) };
         if result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND {
             return Err(Error::message(format!(
@@ -71,12 +138,32 @@ mod platform {
         read_text("DisplayVersion")
     }
 
+    pub fn legacy_installations() -> Vec<crate::setup::Installed> {
+        LEGACY_KEYS
+            .into_iter()
+            .filter_map(|key| {
+                let directory = PathBuf::from(crate::setup::normalize(&read_key_text(
+                    key,
+                    "InstallLocation",
+                )?));
+                Some(crate::setup::Installed {
+                    directory,
+                    version: read_key_text(key, "DisplayVersion"),
+                })
+            })
+            .collect()
+    }
+
     /// 已打开的登记项，离开作用域时关闭。
     struct Key(HKEY);
 
     impl Key {
         fn create() -> Result<Self, Error> {
-            let subkey = wide(KEY);
+            Self::create_at(KEY)
+        }
+
+        fn create_at(name: &str) -> Result<Self, Error> {
+            let subkey = wide(name);
             let mut key: HKEY = ptr::null_mut();
             let result = unsafe {
                 RegCreateKeyExW(
@@ -139,7 +226,11 @@ mod platform {
     }
 
     fn read_text(name: &str) -> Option<String> {
-        let subkey = wide(KEY);
+        read_key_text(KEY, name)
+    }
+
+    fn read_key_text(key_name: &str, name: &str) -> Option<String> {
+        let subkey = wide(key_name);
         let mut key: HKEY = ptr::null_mut();
         let result =
             unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key) };
@@ -211,5 +302,16 @@ mod platform {
 
     pub fn installed_version() -> Option<String> {
         None
+    }
+
+    pub fn legacy_installations() -> Vec<crate::setup::Installed> {
+        Vec::new()
+    }
+    pub fn remove_legacy(_: &Path) -> Result<(), Error> {
+        Ok(())
+    }
+
+    pub fn relocate_environment(_: &[(PathBuf, PathBuf)]) -> Result<(), Error> {
+        Ok(())
     }
 }

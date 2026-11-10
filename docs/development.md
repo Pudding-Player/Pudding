@@ -30,7 +30,7 @@ npm run dist
 | `npm run clean:rust -- -WhatIf` | 预览可清理的 Rust 缓存 |
 | `npm run clean:rust` | 清理上述缓存 |
 
-完整构建由 `scripts/build.cmd` 执行，先按锁定文件获取并编译四套桥，再构建主仓 UI、Rust 主程序和安装器。独立仓构建入口与本地开发方式见[仓库与构建链路](repositories.md)。桥通过影拷贝加载；重建不强制结束 BetterGI，连接后核对实际加载版本。
+完整构建由 `scripts/build.cmd` 执行，先按锁定文件获取并编译启用的桥，再构建主仓 UI、Rust 主程序和安装器。独立仓构建入口与本地开发方式见[仓库与构建链路](repositories.md)。桥通过影拷贝加载；重建不强制结束 BetterGI，连接后核对实际加载版本。
 
 安装器入口为 `src/bin/pudding-setup.rs`，原生界面为 `src/setup/ui.slint`，由 `setup` 特性构建并嵌入。Vite 只构建主程序和托盘界面。安装器固定使用深色样式，不读取主程序主题设置；要求管理员权限，窗口首次显示时居中。运行时检测、安装、更新和卸载通过 Rust 安装引擎执行。
 

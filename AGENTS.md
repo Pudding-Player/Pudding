@@ -38,7 +38,7 @@
 | --- | --- |
 | `target/debug/`、`target/release/` | Cargo 标准构建结果与缓存，保留供增量构建使用；不是第二份分发目录。 |
 | `target/ui/`、`target/bridge/`、`target/dotnet/` | 前端、桥与 native/.NET 的标准构建结果。 |
-| `target/setup/staging/` | 唯一 Windows 安装包组装暂存目录，只含主程序、四套桥组件、插件及空凭据模板。不得在此启动产品；每次从明确清单组装，组包结束后清理。 |
+| `target/setup/staging/` | 唯一 Windows 安装包组装暂存目录，只含主程序、启用的桥组件、插件及空凭据模板。不得在此启动产品；每次从明确清单组装，组包结束后清理。 |
 | `target/setup/payload.bin`、`target/setup/payload.json` | 安装器编译输入，生成并校验后嵌入安装器；本轮安装器构建结束后清理。 |
 | `target/dev/` | 开发 IPC 端口文件、开发配置、用户数据及开发运行资源；既有开发配置入口为 `target/dev/user/config.json`。 |
 | `target/dev/desktop/` | 需要启动组装版桌面程序时的固定开发目录；不得借启动或验收往 `dist/` 写运行数据。默认打包无需额外交付此目录。 |
@@ -73,7 +73,7 @@ dist/
 
 - 默认仅保留当前交付版本的一套 Windows 安装包及其对应校验文件、清单，不堆历史版本，不同时留下 ZIP、另一份 EXE 或解包后的同内容目录。版本归档由正式发布渠道承担。
 - Android 交付物仅归 `dist/android/`；未做该平台交付时，不为凑目录树创建空目录。其他平台确需增加时，先在本文件登记唯一子目录，并同步相关脚本。
-- 独立适配插件仅归 `dist/plugins/<插件 ID>/`，由 `scripts/package-adapters.ps1` 按明确清单组装与校验；每个插件只保留一份当前目录，不同时另留 ZIP 或源码副本。不得带第三方工具本体、源码、测试程序、构建脚本、凭据或运行数据，不默认自动启用；是否内置由桥锁定清单的 bundled 字段控制，当前四套桥内置安装包。
+- 独立适配插件仅归 `dist/plugins/<插件 ID>/`，由 `scripts/package-adapters.ps1` 按明确清单组装与校验；每个插件只保留一份当前目录，不同时另留 ZIP 或源码副本。不得带第三方工具本体、源码、测试程序、构建脚本、凭据或运行数据，不默认自动启用；是否内置由桥锁定清单的 bundled 字段控制，当前仅 BGI 桥内置安装包，另外三座桥暂时停用。
 - 安装包、校验文件、清单必须来自同一轮构建，文件名、版本、体积与 SHA-256 必须一致。稳定命名并覆盖同版本文件，不使用 `new`、`final`、`latest`、`copy`、`backup`、`release-v2` 或时间戳后缀。
 - 本地构建的清单必须明确尚未发布，不能沿用旧的已发布时间、远端下载地址或校验值来冒充当前包已上线。
 - 禁止出现 `.cache/`、`user/`、`data/`、`.sleepy-doll/`、`.pudding/`、`bridge-cache/`、WebView2 运行目录、日志、测试安装目录、宣传素材、提示词和临时清单。安装器编译输入与组装暂存目录归 `target/setup/`。

@@ -6,11 +6,7 @@ import { ConfirmDialog } from "@pudding/ui/overlay/ConfirmDialog";
 import { useMessage } from "@pudding/ui/overlay/Message";
 import { SlidingTabs } from "@pudding/ui/controls/SlidingTabs";
 import { CalendarIcon, CloseIcon, PlusIcon } from "@pudding/ui/icons";
-import {
-  useFlipList,
-  usePresence,
-  motionDisabled,
-} from "@pudding/ui/motion";
+import { useFlipList, usePresence, motionDisabled } from "@pudding/ui/motion";
 import {
   scheduler,
   scheduleTime,
@@ -541,7 +537,6 @@ export function ScheduleEditor({
         open={open}
         title={schedule ? "编辑定时任务" : "新建定时任务"}
         className="schedule-dialog"
-        initialFocus="dialog"
         onClose={requestClose}
         footer={
           <>

@@ -592,13 +592,6 @@
   transform: none;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .activity-disclosure-motion {
-    transition: none;
-    transform: none;
-  }
-}
-
 @keyframes stream-caret {
   50% {
     opacity: 0;

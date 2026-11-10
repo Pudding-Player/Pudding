@@ -144,9 +144,3 @@ body {
 .tray-stop:not(:disabled):hover {
   background: color-mix(in srgb, #b34536 9%, var(--surface));
 }
-@media (prefers-reduced-motion: reduce) {
-  .tray-row,
-  .tray-switch-row {
-    transition: none;
-  }
-}

@@ -195,11 +195,15 @@ fn validate_installation(
     fallback: Option<&Path>,
 ) -> Result<(), Error> {
     super::validate_directory(&directory.to_string_lossy())?;
-    if !directory.file_name().is_some_and(|name| {
-        name.eq_ignore_ascii_case(super::NAME) || name.eq_ignore_ascii_case(super::SLUG)
-    }) || ![super::EXECUTABLE, UNINSTALLER]
-        .iter()
-        .any(|name| directory.join(name).is_file())
+    let registered = super::registry::install_location()
+        .is_some_and(|installed| super::same_path(&installed, directory));
+    if !(registered
+        || directory.file_name().is_some_and(|name| {
+            name.eq_ignore_ascii_case(super::NAME) || name.eq_ignore_ascii_case(super::SLUG)
+        }))
+        || ![super::EXECUTABLE, UNINSTALLER]
+            .iter()
+            .any(|name| directory.join(name).is_file())
     {
         return Err(Error::message("卸载目录不属于 Pudding，未删除任何文件"));
     }

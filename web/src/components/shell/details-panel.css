@@ -354,14 +354,6 @@
     transform: translateY(0);
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .details-panel .task-card {
-    transition: none;
-  }
-  .details-content[data-motion="panel"] {
-    animation: none;
-  }
-}
 
 .shortcut-shelf .details-body {
   gap: 16px;

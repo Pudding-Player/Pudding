@@ -392,7 +392,10 @@ fn request_close(ui: &SetupWindow) {
 
 fn continue_install(ui: &SetupWindow, ctx: Arc<Mutex<Context>>) {
     let context = ctx.lock().unwrap().clone();
-    if (context.uninstall || context.update) && !context.close_blockers {
+    if (context.uninstall || context.update)
+        && !context.close_blockers
+        && (context.uninstall || !setup::install::is_legacy_upgrade(&context.directory))
+    {
         let blockers = open_archive().and_then(|archive| {
             if context.uninstall {
                 setup::uninstall::blocking_programs(&archive, &context.directory)

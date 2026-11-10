@@ -347,9 +347,25 @@ impl AppConfig {
         expand_env(&mut expanded)?;
         let mut config: Self = serde_json::from_value(expanded)?;
         config.validate()?;
+        let mut changed = false;
+        // 更名安装器曾将完整文件匹配的空后缀拼成目录分隔符；仅修复确实存在的文件。
+        let database = config.storage.database.to_string_lossy();
+        if database.ends_with(['/', '\\']) {
+            let corrected = PathBuf::from(database.trim_end_matches(['/', '\\']));
+            if absolute(&base, &corrected).is_file() {
+                config.storage.database = corrected;
+                if !value["storage"]["database"]
+                    .as_str()
+                    .is_some_and(|raw| raw.contains("${ENV:"))
+                {
+                    value["storage"]["database"] = serde_json::json!(config.storage.database);
+                    changed = true;
+                }
+            }
+        }
         let original_database = absolute(&base, &config.storage.database);
         crate::data_directory::migrate(&base, &original_database)?;
-        let mut changed = relocate_data_path(
+        changed |= relocate_data_path(
             &base,
             &mut value["storage"]["database"],
             &mut config.storage.database,
@@ -874,7 +890,8 @@ fn resolve_from(
 }
 
 fn explicit_config(raw: &OsStr, exe_dir: Option<&Path>) -> Result<PathBuf> {
-    let path = PathBuf::from(raw);
+    let original = PathBuf::from(raw);
+    let path = crate::setup::relocated_legacy_config(&original).unwrap_or(original);
     let is_json = path
         .extension()
         .and_then(OsStr::to_str)

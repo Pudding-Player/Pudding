@@ -14,6 +14,7 @@ export function usePresence(
     y?: number;
     scale?: number;
     content?: RefObject<HTMLElement | null>;
+    duration?: number;
   } = {},
 ) {
   const [retained, setRetained] = useState(open);
@@ -21,7 +22,7 @@ export function usePresence(
   const generation = useRef(0);
   const previous = useRef<HTMLElement | null>(null);
   const previousContent = useRef<HTMLElement | null>(null);
-  const { y = 5, scale = 0.985, content } = options;
+  const { y = 5, scale = 0.985, content, duration = 240 } = options;
   useLayoutEffect(() => {
     const node = ref.current;
     if (!node) {
@@ -39,22 +40,34 @@ export function usePresence(
       (panel ?? node).style.transform = `translateY(${y}px) scale(${scale})`;
       previous.current = node;
     }
-    if (open && !retained) setRetained(true);
+    if (open) setRetained(true);
     const motions = panel
       ? [
-          animateVisual(node, { opacity: open ? 1 : 0 }),
-          animateVisual(panel, {
-            opacity: open ? 1 : 0,
-            y: open ? 0 : y,
-            scale: open ? 1 : scale,
-          }),
+          animateVisual(
+            node,
+            { opacity: open ? 1 : 0 },
+            Math.min(duration, 240),
+          ),
+          animateVisual(
+            panel,
+            {
+              opacity: open ? 1 : 0,
+              y: open ? 0 : y,
+              scale: open ? 1 : scale,
+            },
+            duration,
+          ),
         ]
       : [
-          animateVisual(node, {
-            opacity: open ? 1 : 0,
-            y: open ? 0 : y,
-            scale: open ? 1 : scale,
-          }),
+          animateVisual(
+            node,
+            {
+              opacity: open ? 1 : 0,
+              y: open ? 0 : y,
+              scale: open ? 1 : scale,
+            },
+            duration,
+          ),
         ];
     void Promise.all(motions).then(
       () => {
@@ -64,7 +77,7 @@ export function usePresence(
         /* 取消不是退场完成，不能卸载重新打开的内容。 */
       },
     );
-  }, [open, present, retained, ref, content, y, scale]);
+  }, [open, ref, content, y, scale, duration]);
   useEffect(
     () => () => {
       generation.current++;
