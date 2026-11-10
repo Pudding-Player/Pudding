@@ -21,10 +21,10 @@ jobs:
     runs-on: windows-2022
     env:
       PUDDING_BRIDGE_READ_TOKEN: ${{ secrets.BRIDGE_READ_TOKEN }}
-      TEMP: ${{ github.workspace }}\target\ci\tmp
-      TMP: ${{ github.workspace }}\target\ci\tmp
-      npm_config_cache: ${{ github.workspace }}\target\ci\npm-cache
-      WRANGLER_LOG_PATH: ${{ github.workspace }}\target\ci\wrangler
+      TEMP: ${{ github.workspace }}\target\tmp
+      TMP: ${{ github.workspace }}\target\tmp
+      npm_config_cache: ${{ github.workspace }}\target\npm-cache
+      WRANGLER_LOG_PATH: ${{ github.workspace }}\target\tmp\wrangler
       WRANGLER_SEND_METRICS: "false"
       NODE_DISABLE_COMPILE_CACHE: "1"
       CLOUDFLARE_ACCOUNT_ID: "31b280af27ff4bf0d338ecd49cf27902"

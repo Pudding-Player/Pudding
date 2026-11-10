@@ -10,11 +10,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      TEMP: ${{ github.workspace }}/target/ci/tmp
-      TMP: ${{ github.workspace }}/target/ci/tmp
-      TMPDIR: ${{ github.workspace }}/target/ci/tmp
-      npm_config_cache: ${{ github.workspace }}/target/ci/npm-cache
-      WRANGLER_LOG_PATH: ${{ github.workspace }}/target/ci/wrangler
+      TEMP: ${{ github.workspace }}/target/tmp
+      TMP: ${{ github.workspace }}/target/tmp
+      TMPDIR: ${{ github.workspace }}/target/tmp
+      npm_config_cache: ${{ github.workspace }}/target/npm-cache
+      WRANGLER_LOG_PATH: ${{ github.workspace }}/target/tmp/wrangler
       WRANGLER_SEND_METRICS: "false"
       CLOUDFLARE_ACCOUNT_ID: "31b280af27ff4bf0d338ecd49cf27902"
       R2_BUCKET: sleepy-doll-releases
