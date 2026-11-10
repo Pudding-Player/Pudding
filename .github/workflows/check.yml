@@ -57,8 +57,9 @@ jobs:
           $lines = Get-Content -LiteralPath target/tmp/rust-library-tests.log
           $lines | Write-Output
           if ($result -ne 0) {
-            foreach ($line in ($lines | Select-String -Pattern 'FAILED|panicked at|^error:|^test result:')) {
-              $message = $line.ToString().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            foreach ($line in ($lines | Select-String -Pattern '\.\.\. FAILED$|panicked at|^error:|^test result:' -Context 0,3)) {
+              $detail = (@($line.Line) + @($line.Context.PostContext)) -join "`n"
+              $message = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
               Write-Output "::error::$message"
             }
           }

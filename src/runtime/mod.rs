@@ -1029,6 +1029,13 @@ impl Supervisor {
         self.schedule_mode(false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn dispatch_guard_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, CancellationToken>> {
+        self.active.lock().unwrap()
+    }
+
     fn schedule_mode(self: &Arc<Self>, bound_only: bool) -> Result<()> {
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());

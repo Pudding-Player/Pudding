@@ -1733,6 +1733,8 @@ mod question_rpc_tests {
                 .state,
             RunState::NeedsReview
         );
+        // 手动构造持久化状态时暂停调度，避免后台抢先运行这个无模型配置的夹具。
+        let dispatch = controller.supervisor.dispatch_guard_for_test();
         let mut fresh = controller
             .supervisor
             .journal
@@ -1753,6 +1755,7 @@ mod question_rpc_tests {
             controller.supervisor.journal.get(&fresh.id).unwrap().state,
             RunState::AwaitingUser
         );
+        drop(dispatch);
         controller.shutdown();
     }
 
